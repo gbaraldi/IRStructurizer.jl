@@ -30,16 +30,21 @@ end
 
 Optional context for structurizing loop bodies. When present, back-edges to
 `header` become ContinueOp and edges outside `loop_blocks` become BreakOp.
-`carried_values` are collected before the walk, which may still rename them
-(`bind_single_pred_args!`), so they go through `ssa_remap` when the ContinueOp is
-emitted, like every other operand the walk emits.
+`carried_values` are the back edge's operands for the carries with stable ids
+`carried_ids` and types `carried_types`. They are collected before the walk, which
+may still rename them (`bind_single_pred_args!`), so they go through `ssa_remap`
+when the ContinueOp is emitted, like every other operand the walk emits.
 """
 struct LoopCtx
     header::Int
     loop_blocks::Set{Int}
     carried_values::Vector{IRValue}
+    carried_ids::Vector{Int}
+    carried_types::Vector{Any}
     break_values::Vector{IRValue}
 end
+LoopCtx(header::Int, loop_blocks::Set{Int}) =
+    LoopCtx(header, loop_blocks, IRValue[], Int[], Any[], IRValue[])
 
 """The operands edge `src` to `dst` carries (parallel to `dst`'s block arguments),
 or `nothing` if `src` has no edge to `dst`. A degenerate `GotoIfNot` whose two edges
@@ -168,8 +173,9 @@ function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
                             loop_ctx::LoopCtx)
     if dest == loop_ctx.header
         block.terminator === nothing &&
-            (block.terminator = ContinueOp(IRValue[remap_ssa_ref(v, ctx.ssa_remap)
-                                                   for v in loop_ctx.carried_values]))
+            (block.terminator = ContinueOp(IRValue[
+                narrow_edge_value!(block, ctx, v, T, id) for (v, T, id) in
+                zip(loop_ctx.carried_values, loop_ctx.carried_types, loop_ctx.carried_ids)]))
         return true
     elseif dest ∉ loop_ctx.loop_blocks
         block.terminator === nothing &&
@@ -197,7 +203,9 @@ end
 """Bind the single-predecessor block arguments of `b`. A block argument fed by
 exactly one predecessor edge is a copy of that edge's operand, left by an edge
 multiplexer's dispatch. An SSA-valued operand becomes a rename (`ssa_remap`); a
-constant/argument/undef operand is materialized as a copy at the arg's id.
+constant/argument/undef operand is materialized as a copy at the arg's id. An
+operand wider than the argument (see `narrow_edge_value!`) becomes a `PiNode` at
+the arg's id instead, so its uses keep the refinement.
 If a loop has already reserved a renamed id, emit the copy there instead.
 Multi-predecessor args (loop headers, branch merges) carry >=2 distinct edge
 operands and are resolved by the loop/branch machinery instead, so they are skipped
@@ -213,17 +221,20 @@ function bind_single_pred_args!(block::Block, ctx::StructurizeCtx, b::Int)
     for (k, arg) in enumerate(args)
         idx = get(ctx.ssa_remap, arg, arg)
         haskey(block.body, idx) && continue
+        T = get(ctx.types, arg, Any)
         v = remap_ssa_ref(ops[k], ctx.ssa_remap)
+        edge_operand_type(ctx, ops[k]) <: T || (v = PiNode(v, T))
         if idx != arg
             # An enclosing loop reserved this id for an escaping value. Define
             # the copy there so its continue/break operands have a definition.
-            push!(block, idx, v, get(ctx.types, arg, Any))
+            push!(block, idx, v, T)
             anchor_line!(ctx, idx, arg)
         elseif v isa SSAValue
             ctx.ssa_remap[arg] = v.id
         else
-            # A constant / argument / undef copy. It keeps the arg's own line entry.
-            push!(block, arg, v, get(ctx.types, arg, Any))
+            # A constant / argument / undef copy, or a PiNode. It keeps the arg's
+            # own line entry.
+            push!(block, arg, v, T)
         end
     end
 end
@@ -380,12 +391,42 @@ function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo
         if v isa Undef
             push!(vals, Undef(minfo.types[j]))
         else
-            v = remap_ssa_ref(v, ctx.ssa_remap)
             idx = get(ctx.ssa_remap, minfo.ids[j], minfo.ids[j])
-            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) : v)
+            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) :
+                        narrow_edge_value!(blk, ctx, v, minfo.types[j], minfo.ids[j]))
         end
     end
     blk.terminator = YieldOp(vals)
+end
+
+"""The edge operand `v`, remapped, for a block argument of type `T` (an IfOp result,
+a loop carry). Julia types a phi by what inference knows on each incoming edge, so
+the phi can be narrower than the value: `x::Any` reaching it from behind an
+`x isa Int` check feeds an `Int` phi. A structured op's operand must fit its slot,
+so a wider operand is narrowed with a `PiNode` in `blk`, which runs only when the
+edge is taken and so where the refinement holds. `anchor` is the slot's id, for
+debug info."""
+function narrow_edge_value!(blk::Block, ctx::StructurizeCtx, @nospecialize(v),
+                            @nospecialize(T), anchor::Int)
+    S = edge_operand_type(ctx, v)
+    v = remap_ssa_ref(v, ctx.ssa_remap)
+    S <: T && return v
+    pi = alloc_ssa!(ctx)
+    push!(blk, pi, PiNode(v, T), T)
+    anchor_line!(ctx, pi, anchor)
+    return SSAValue(pi)
+end
+
+"""The widened type of the edge operand `v`, before renaming (as `argextype`, which
+needs the finished `StructuredIRCode`). `Undef` never needs narrowing."""
+function edge_operand_type(ctx::StructurizeCtx, @nospecialize(v))
+    v isa Undef && return Union{}
+    v isa SSAValue && return get(ctx.types, v.id, Any)
+    v isa Argument && return widenconst((ctx.m::MCFG).argtypes[v.n])
+    v isa GlobalRef && return widenconst(global_lattice_element(v, promotion_world(ctx)))
+    is_binding_partition(v) && return widenconst(partition_lattice_element(v))
+    v isa QuoteNode && return typeof(v.value)
+    return typeof(v)
 end
 
 """The arm's exit block: the seed (in `blocks`, else the branch source `fallback`)

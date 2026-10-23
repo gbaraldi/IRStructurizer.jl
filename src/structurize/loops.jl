@@ -252,12 +252,12 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         # by the IfOp that yields into the pre-header). Remap through `ssa_remap`
         # (a single-edge pre-header arg may have been renamed, not emitted at its
         # own index).
-        init_val = remap_ssa_ref(phi.entry_val, ctx.ssa_remap)
-        push!(init_values, init_val)
+        T = ctx.types[phi.ssa_idx]
+        push!(init_values, narrow_edge_value!(block, ctx, phi.entry_val, T, phi.ssa_idx))
         push!(carried_values, phi.carried_val)
         push!(phi_indices, phi.ssa_idx)
-        push!(phi_types, ctx.types[phi.ssa_idx])
-        arg = BlockArgument(alloc_arg!(ctx), ctx.types[phi.ssa_idx])
+        push!(phi_types, T)
+        arg = BlockArgument(alloc_arg!(ctx), T)
         push!(body.args, arg)
         subs[phi.ssa_idx] = arg
     end
@@ -277,7 +277,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         # `ex.type` is already widened (`ctx.types`); widen again to stay robust.
         ext = widenconst(ex.type)
         push!(init_values, Undef(ext))
-        push!(carried_values, SSAValue(fresh))  # carry the fresh-index value
+        push!(carried_values, SSAValue(ex.ssa_idx))  # renamed to `fresh` in the body
         push!(phi_indices, ex.ssa_idx)
         push!(phi_types, ext)
         arg = BlockArgument(alloc_arg!(ctx), ext)
@@ -285,7 +285,7 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
     end
 
     # 5. Build loop body
-    build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
+    build_loop_body!(body, ctx, header, loop_blocks, carried_values, phi_indices, subs)
 
     # Restore remap (scoped to loop body)
     ctx.ssa_remap = saved_remap
@@ -323,15 +323,17 @@ become BreakOp.
 """
 function build_loop_body!(body::Block, ctx::StructurizeCtx, header::Int,
                            loop_blocks::Set{Int}, carried_values::Vector{IRValue},
-                           subs::Dict{Int, BlockArgument})
+                           carried_ids::Vector{Int}, subs::Dict{Int, BlockArgument})
     break_values = IRValue[arg for arg in body.args]
     # Extra exits (beyond header phis) must carry the current iteration's
     # computed value, not the stale block arg from the previous iteration.
     n_header_phis = length(subs)
     for i in (n_header_phis + 1):length(break_values)
-        break_values[i] = carried_values[i]
+        break_values[i] = remap_ssa_ref(carried_values[i], ctx.ssa_remap)
     end
-    lctx = LoopCtx(header, loop_blocks, carried_values, break_values)
+    carried_types = Any[arg.type for arg in body.args]
+    lctx = LoopCtx(header, loop_blocks, carried_values, carried_ids, carried_types,
+                   break_values)
 
     content = structurize_region!(ctx, header, loop_blocks; loop_ctx=lctx)
 

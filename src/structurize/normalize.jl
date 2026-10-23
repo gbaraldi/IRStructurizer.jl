@@ -326,7 +326,7 @@ function enclosing_loop_ctx(loops::Dict{Int, Set{Int}}, E::Int)
         end
     end
     best_body === nothing && return nothing
-    return LoopCtx(best_h, best_body, IRValue[], IRValue[])
+    return LoopCtx(best_h, best_body)
 end
 
 """Find one conditional with a multi-entry continuation and route every edge into
