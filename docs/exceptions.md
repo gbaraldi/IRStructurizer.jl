@@ -485,6 +485,17 @@ may instead end in the first exception the direct call throws.
 The battery outside the test suite also covers a try returning a `Union`
 (`p3`).
 
+`test/julialowering_cases.jl` round-trips 151 more functions the same way. About
+100 come from the control-flow tests of JuliaLowering.jl: every try/catch/else/
+finally combination in tail, value and statement position, returns out of nested
+trys and catches, `@goto` out of trys and catches, `&&`/`||` chains, while and for
+loops (multidimensional, `outer`, destructuring), comprehensions, generators,
+closures and scoping. The other 51 are added: irreducible loops built from `@goto`
+with trys inside, around and entering them, returns from catches two and three
+deep, finally with every exit kind, ScopedValues, and bodies that never complete.
+Each runs in both modes with promotion on and off, again with `Any` arguments, and
+with the optimizer stopped after its first and second compaction.
+
 Beyond the hand-written shapes, every Base/stdlib method with a concrete
 signature was swept: 93 have an `EnterNode` after optimization on Julia 1.12, and
 103 on 1.13. In both modes (186 and 206 lifts), all of them lift with full
@@ -495,19 +506,19 @@ converge until the handler boundary at `pop_exception` (§4.1).
 
 **Not handled or known limitations**
 
-- Irreducible control flow that crosses a try boundary is untested. A mux that
-  would join different handler stacks is caught by `verify_try_structure`, which
-  throws, rather than miscompiled.
+- Irreducible control flow is tested with a try inside an irreducible loop, an
+  irreducible loop inside a try body, and a body and catch that enter a loop at
+  different labels. A mux that would join different handler stacks is still caught
+  by `verify_try_structure`, which throws, rather than miscompiled.
 - `pop_exception` retargeting covers the "leave outer, then pop inner" shape that
-  Julia emits. A pop after leaving a try from a handler nested two catch levels
-  deep is still correct as structured IR (the token semantics hold), but its
-  lowered `IRCode` may fail Julia's dominance check.
+  Julia emits, including returns from catches nested two and three levels deep
+  inside a try. Other placements of a pop after a leave are untested.
 - Outputs can be verbose: a try with several exit kinds gets a discriminator
   dispatch after it, as multi-exit loops already do.
 - The try analyses are recomputed on every normalization step. That is cheap for
   ordinary functions and quadratic-ish in the number of trys for huge ones. Code
   without trys does no extra work.
-- Only tested on Julia 1.12.
+- Tested on Julia 1.12 and 1.13.
 
 **Fixes to pre-existing code made along the way** (exposed by EH shapes, not
 EH-specific)
