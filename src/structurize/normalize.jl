@@ -179,20 +179,23 @@ end
 
 """Reduce form (the latch-arg half of MLIR's `transformToReduceLoop`). For every
 value defined inside the loop and used outside it, add a latch block argument fed
-`value`-or-`undef` from each exit edge by dominance, and rewrite the outside uses
-to that latch arg. The back edges (`back_refs`) feed `undef`: the latch arg only
-serves uses outside the loop, so the value it carries around to the next
-iteration is never read, and passing the iteration's value there would keep it
-alive across the back edge for nothing. After this every loop-internal value read
-downstream is a latch block arg, so the lift threads it out as a `BreakOp` result
-with no escape scan. `LoopOp` has separate `Break`/`Continue` values, so only this
-latch-arg half is needed: no header arg, no exit-block arg.
+`value`-or-`undef` from each latch predecessor, and rewrite the outside uses to
+that latch arg. An edge feeds the value only when it is an exit edge, the value
+dominates it, and the edge's original target (`exit_targets`, recorded before the
+edge was redirected to the latch) reaches an outside use of the value without
+re-entering the loop. Every other edge feeds `undef`: the latch arg only serves
+uses outside the loop, so the value carried around a back edge or out through an
+exit that never reads it would only be kept alive for nothing. After this every
+loop-internal value read downstream is a latch block arg, so the lift threads it
+out as a `BreakOp` result with no escape scan. `LoopOp` has separate
+`Break`/`Continue` values, so only this latch-arg half is needed: no header arg,
+no exit-block arg.
 
 Excludes the latch's own block args (the mux slices and discriminator already
 become loop results through the post-loop dispatch). `loop_blocks` must include
 `latch`."""
 function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int},
-                      back_refs::Vector{EdgeRef})
+                      exit_targets::Dict{EdgeRef, Int})
     domtree = construct_domtree(build_cfg(m))
 
     # Definition site and type of each SSA id. Block-arg types live in `m.types`;
@@ -208,18 +211,38 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int},
 
     # Escaping values: loop-internal defs referenced from a non-loop block, in
     # deterministic (block, first-seen) order. The latch's own args are skipped.
+    # Also record the blocks using each one. Exit-edge operands are not among
+    # them: those edges leave loop blocks and already feed the mux slices.
     latch_args = Set(m.blocks[latch].args)
     escaping = Int[]
-    seen = Set{Int}()
+    use_blocks = Dict{Int, Set{Int}}()
     for bid in 1:length(m.blocks)
         bid in loop_blocks && continue
         for id in _mblock_use_ids(m.blocks[bid])
             (get(def_block, id, 0) in loop_blocks) || continue
-            (id in latch_args || id in seen) && continue
-            push!(escaping, id); push!(seen, id)
+            id in latch_args && continue
+            haskey(use_blocks, id) || push!(escaping, id)
+            push!(get!(Set{Int}, use_blocks, id), bid)
         end
     end
     isempty(escaping) && return
+
+    # The blocks reachable from each original exit target without re-entering
+    # the loop. A path back into the loop runs the latch again, which redefines
+    # the latch arg, so a use beyond it never reads the value fed here. Blocks of
+    # an enclosing loop count as outside, which can only over-approximate.
+    reach = Dict{Int, Set{Int}}()
+    for t in unique(values(exit_targets))
+        seen = Set{Int}()
+        wl = Int[t]
+        while !isempty(wl)
+            b = pop!(wl)
+            (b in seen || b in loop_blocks) && continue
+            push!(seen, b)
+            append!(wl, _term_targets(m.blocks[b].term))
+        end
+        reach[t] = seen
+    end
 
     # All edges into the latch (the back + exit edges, post-redirect).
     pred_refs = EdgeRef[]
@@ -236,7 +259,9 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int},
         dv = def_block[v]
         for ref in pred_refs
             e = edge_of(m, ref)
-            feed = !(ref in back_refs) && dominates(domtree, dv, ref.src)
+            t = get(exit_targets, ref, 0)
+            feed = t != 0 && dominates(domtree, dv, ref.src) &&
+                   !isdisjoint(reach[t], use_blocks[v])
             push!(e.args, feed ? SSAValue(v) : Undef(T))
         end
         fv(@nospecialize(w)) = (w isa SSAValue && w.id == v) ? SSAValue(larg) : w
@@ -263,8 +288,9 @@ function normalize_one_loop_latch!(m::MCFG)
             end
         end
         (length(exit_refs) >= 2 || length(back_refs) >= 2) || continue
+        exit_targets = Dict(r => edge_of(m, r).target for r in exit_refs)
         mux = single_exiting_latch!(m, h, back_refs, exit_refs)
-        reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))), back_refs)
+        reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))), exit_targets)
         return true
     end
     return false

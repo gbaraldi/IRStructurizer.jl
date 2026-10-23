@@ -992,6 +992,9 @@ end
     @test length(back) == 1 && length(exits) == 3
     @test all(e -> all(isundef, e.escapes), back)
     @test all(e -> any(!isundef, e.escapes), exits)
+    # Each exit feeds only the two values its own return reads: z/out, z/dz, and
+    # the updated z/out on the normal exit.
+    @test all(e -> count(!isundef, e.escapes) == 2, exits)
     sci, _ = code_structured(newton, Tuple{Float64, Float64}) |> only
     for (x, z) in ((2.0, 1.0), (2.0, 0.5), (1e-9, 1e10), (0.0, Inf), (3.0, 1e8))
         @test isequal(execute(sci, x, z), newton(x, z))
@@ -1028,10 +1031,59 @@ end
     back = filter(e -> e.sr === 1, l.edges)
     @test sort([e.src for e in back]) == [5, 6]
     @test all(e -> all(isundef, e.escapes), back)
-    @test all(e -> any(!isundef, e.escapes), filter(e -> e.sr === 0, l.edges))
+    exits = filter(e -> e.sr === 0, l.edges)
+    @test all(e -> any(!isundef, e.escapes), exits)
+    # %3 dominates the bottom-tested exit B6→B7, but B7 only reads %11.
+    @test all(e -> count(!isundef, e.escapes) == 1, exits)
     sci = StructuredIRCode(two_back_ir())
     for n in (0, 1, 4, 10), m in (0, 5, 30, 1000)
         @test execute(sci, n, m) == two_back_ref(n, m)
+    end
+
+    # Both exits read `i`, so both keep it.
+    function both_use(v::Vector{Int}, n::Int)
+        i = 0
+        while true
+            i += 1
+            i > n && return i
+            v[i] == 0 && return -i
+        end
+    end
+    ir, _ = only(code_ircode(both_use, Tuple{Vector{Int}, Int}))
+    exits = filter(e -> e.sr === 0, latch_of(ir).edges)
+    @test length(exits) == 2
+    @test all(e -> !isempty(e.escapes) && !any(isundef, e.escapes), exits)
+    sci, _ = code_structured(both_use, Tuple{Vector{Int}, Int}) |> only
+    for (v, n) in ((Int[1, 2, 3], 3), (Int[1, 0, 3], 3), (Int[0], 0), (Int[1, 2], 1))
+        @test execute(sci, v, n) == both_use(v, n)
+    end
+
+    # The inner loop's exits continue into the outer loop body, which reads `s`
+    # and `j` (directly, or through a block that does not read them itself).
+    function nested(v::Vector{Int}, n::Int)
+        s = 0
+        for k in 1:n
+            j = 0
+            while true
+                j += 1
+                if j >= k
+                    s += 1
+                    break
+                end
+                v[j] < 0 && break
+                s += 2
+            end
+            s += j
+        end
+        return s
+    end
+    ir, _ = only(code_ircode(nested, Tuple{Vector{Int}, Int}))
+    keeps_all(l) = all(e -> e.sr !== 0 || !any(isundef, e.escapes), l.edges) &&
+                   count(e -> e.sr === 0 && !isempty(e.escapes), l.edges) >= 2
+    @test any(keeps_all, latch_edges(IRStructurizer.normalize_cf(ir)))
+    sci, _ = code_structured(nested, Tuple{Vector{Int}, Int}) |> only
+    for v in (Int[1, 2, 3, 4, 5], Int[1, -2, 3, -4, 5], Int[-1, -1, -1, -1, -1]), n in 0:5
+        @test execute(sci, v, n) == nested(v, n)
     end
 end
 
