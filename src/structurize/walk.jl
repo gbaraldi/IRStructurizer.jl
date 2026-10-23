@@ -193,7 +193,9 @@ end
 """Bind the single-predecessor block arguments of `b`. A block argument fed by
 exactly one predecessor edge is a copy of that edge's operand, left by an edge
 multiplexer's dispatch. An SSA-valued operand becomes a rename (`ssa_remap`); a
-constant/argument/undef operand is materialized as a copy at the arg's id.
+constant/argument/undef operand is materialized as a copy at the arg's id. An
+operand wider than the argument (see `narrow_edge_value!`) becomes a `PiNode` at
+the arg's id instead, so its uses keep the refinement.
 If a loop has already reserved a renamed id, emit the copy there instead.
 Multi-predecessor args (loop headers, branch merges) carry >=2 distinct edge
 operands and are resolved by the loop/branch machinery instead, so they are skipped
@@ -209,16 +211,18 @@ function bind_single_pred_args!(block::Block, ctx::StructurizeCtx, b::Int)
     for (k, arg) in enumerate(args)
         idx = get(ctx.ssa_remap, arg, arg)
         haskey(block.body, idx) && continue
+        T = get(ctx.types, arg, Any)
         v = remap_ssa_ref(ops[k], ctx.ssa_remap)
+        edge_operand_type(ctx, ops[k]) <: T || (v = PiNode(v, T))
         if idx != arg
             # An enclosing loop reserved this id for an escaping value. Define
             # the copy there so its continue/break operands have a definition.
-            push!(block, idx, v, get(ctx.types, arg, Any))
+            push!(block, idx, v, T)
             anchor_line!(ctx, idx, arg)
         elseif v isa SSAValue
             ctx.ssa_remap[arg] = v.id
         else
-            push!(block, arg, v, get(ctx.types, arg, Any))   # constant / argument / undef copy
+            push!(block, arg, v, T)   # constant / argument / undef copy, or a PiNode
             anchor_line!(ctx, arg, arg)
         end
     end
@@ -376,12 +380,38 @@ function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo
         if v isa Undef
             push!(vals, Undef(minfo.types[j]))
         else
-            v = remap_ssa_ref(v, ctx.ssa_remap)
             idx = get(ctx.ssa_remap, minfo.ids[j], minfo.ids[j])
-            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) : v)
+            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) :
+                        narrow_edge_value!(blk, ctx, v, minfo.types[j], minfo.ids[j]))
         end
     end
     blk.terminator = YieldOp(vals)
+end
+
+"""The edge operand `v`, remapped, for a merge slot of type `T`. Julia types a phi
+by what inference knows on each incoming edge, so the phi can be narrower than the
+value: `x::Any` reaching it from behind an `x isa Int` check feeds an `Int` phi.
+Julia's verifier allows that, but a yield must fit its result slot. So a wider
+operand is narrowed with a `PiNode` in `blk`, the region that takes the edge, where
+the refinement holds."""
+function narrow_edge_value!(blk::Block, ctx::StructurizeCtx, @nospecialize(v),
+                            @nospecialize(T), anchor::Int)
+    S = edge_operand_type(ctx, v)
+    v = remap_ssa_ref(v, ctx.ssa_remap)
+    S <: T && return v
+    pi = alloc_ssa!(ctx)
+    push!(blk, pi, PiNode(v, T), T)
+    anchor_line!(ctx, pi, anchor)
+    return SSAValue(pi)
+end
+
+"""The type of the edge operand `v`, before renaming: an SSA value's or argument's
+declared type. `Union{}` for a constant or `Undef`, which never need narrowing (a
+constant typed the phi it feeds)."""
+function edge_operand_type(ctx::StructurizeCtx, @nospecialize(v))
+    v isa SSAValue && return get(ctx.types, v.id, Any)
+    v isa Argument && return widenconst((ctx.m::MCFG).argtypes[v.n])
+    return Union{}
 end
 
 """The arm's exit block: the seed (in `blocks`, else the branch source `fallback`)
