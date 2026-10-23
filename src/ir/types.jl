@@ -212,7 +212,25 @@ end
 
 ConditionOp(cond::IRValue) = ConditionOp(cond, IRValue[])
 
-const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, ConditionOp, Nothing}
+"""
+    LeaveOp
+
+Leave the body of the innermost enclosing `TryOp`, popping its handler, and
+continue after the `TryOp` with `values` as its results. This is the structured
+form of Julia's `Expr(:leave, ...)` (and of a Wasm `br` out of a `try_table`).
+
+A `TryOp` body that completes normally ends in a `YieldOp`. A `LeaveOp` is the
+multi-level form, used where the exit sits in a nested region (an `IfOp` arm, or
+the handler of an inner `TryOp`) whose own continuation stays inside the try
+body. It never crosses a loop: try bodies and loops nest properly.
+"""
+struct LeaveOp
+    values::Vector{IRValue}
+end
+
+LeaveOp() = LeaveOp(IRValue[])
+
+const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, ConditionOp, LeaveOp, Nothing}
 
 """
     operands(term) -> Vector{IRValue}
@@ -220,7 +238,7 @@ const Terminator = Union{ReturnNode, YieldOp, ContinueOp, BreakOp, ConditionOp, 
 Get the carried-value operands of a terminator. Provides uniform access
 regardless of whether the terminator stores them in `.values` or `.args`.
 """
-operands(t::Union{ContinueOp, BreakOp, YieldOp}) = t.values
+operands(t::Union{ContinueOp, BreakOp, YieldOp, LeaveOp}) = t.values
 operands(t::ConditionOp) = t.args
 
 #=============================================================================
@@ -512,6 +530,46 @@ function Base.show(io::IO, op::LoopOp)
     print(io, ")")
 end
 
+"""
+    TryOp
+
+Structured try/catch, lifted from Julia's `EnterNode`. The op sits at the
+`EnterNode`'s SSA index, so `Expr(:pop_exception, %t)` statements keep naming it.
+
+- `body`: the protected region, the code that runs with the handler pushed. It
+  ends in a `YieldOp` (normal completion, values become the op's results) or
+  `ReturnNode()` (unreachable). A nested region leaves it with a `LeaveOp`.
+  Leaving the body pops the handler; no explicit `:leave` remains.
+- `handler`: the catch region, or `nothing` for a scope-only enter (Julia's
+  `catch_dest == 0`, no handler). It runs with this op's handler popped and the
+  caught exception on the exception stack (`Expr(:the_exception)` reads it). It
+  ends in a `YieldOp` (values become the op's results), a `ReturnNode`, or an
+  unreachable `ReturnNode()` after a rethrow. Its block arguments are the values
+  the original catch block received through `PhiCNode`s.
+- `upsilons[k]`: the SSA indices of the `UpsilonNode` statements that feed
+  handler argument `k`. When the body throws, argument `k` holds the value of
+  the last one of them that ran. They are statements in the body or before the op.
+- `scope`: the `EnterNode` scope operand (ScopedValues), or `nothing`.
+
+The op's result type is `Tuple{...}` of the continuation values, read with
+`getfield` as for `IfOp`.
+"""
+mutable struct TryOp <: ControlFlowOp
+    body::Block
+    handler::Union{Block, Nothing}
+    upsilons::Vector{Vector{Int}}
+    scope::IRValue
+end
+
+TryOp(body::Block, handler::Union{Block, Nothing}) =
+    TryOp(body, handler, Vector{Int}[], nothing)
+
+function Base.show(io::IO, op::TryOp)
+    print(io, "TryOp(")
+    op.handler === nothing && print(io, "scope-only")
+    print(io, ")")
+end
+
 #=============================================================================
  Block iteration
 =============================================================================#
@@ -535,6 +593,7 @@ blocks(op::IfOp) = (op.then_region, op.else_region)
 blocks(op::ForOp) = (op.body,)
 blocks(op::WhileOp) = (op.before, op.after)
 blocks(op::LoopOp) = (op.body,)
+blocks(op::TryOp) = op.handler === nothing ? (op.body,) : (op.body, op.handler)
 blocks(::ControlFlowOp) = ()
 
 """Recursively fix parent pointers for all sub-blocks."""
@@ -559,6 +618,7 @@ operands(op::IfOp)    = Any[op.condition]
 operands(op::ForOp)   = Any[op.lower, op.upper, op.step, op.init_values...]
 operands(op::WhileOp) = copy(op.init_values)
 operands(op::LoopOp)  = copy(op.init_values)
+operands(op::TryOp)   = op.scope === nothing ? Any[] : Any[op.scope]
 
 #=============================================================================
  Source Location (debug info)
@@ -664,16 +724,20 @@ validates that no unstructured control flow remains.
   control flow remains after structurization
 - `promote`: If true (default), run the `LoopOp` to `WhileOp`/`ForOp` promotion post-pass.
   Pass `false` to keep the generic `LoopOp` form.
+- `exceptions`: How to treat try/catch (`EnterNode`). `:structured` (default) lifts each
+  try region to a `TryOp`. `:trap` assumes nothing throws into a handler (a throw traps):
+  catch handlers are dropped as dead code and only `EnterNode`s that carry a scope
+  survive, as handler-less `TryOp`s.
 """
 function StructuredIRCode(ir::IRCode; structurize::Bool=true, validate::Bool=true,
-                          promote::Bool=true)
+                          promote::Bool=true, exceptions::Symbol=:structured)
     # Collapse every multi-entry CFG situation (irreducible loop headers, multi-exit
     # loops, multi-predecessor continuations) to single-entry with edge multiplexers,
     # then lift the resulting `MCFG` (block args + per-edge operands replace phi nodes).
     # `lift_mcfg` captures debug info from the `MBlock` codelocs and runs the
     # structurize walk.
     if structurize && !isempty(ir.stmts.stmt)
-        return lift_mcfg(normalize_cf(ir); validate, promote)
+        return lift_mcfg(normalize_cf(ir; exceptions); validate, promote)
     end
 
     # Flat view (structurize=false, or empty IR): the raw IRCode statements in a

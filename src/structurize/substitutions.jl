@@ -25,6 +25,9 @@ function substitute_ssa(value, subs::Substitutions)
         return Expr(value.head, new_args...)
     elseif value isa PiNode
         return PiNode(substitute_ssa(value.val, subs), value.typ)
+    elseif value isa Core.UpsilonNode
+        isdefined(value, :val) || return value
+        return Core.UpsilonNode(substitute_ssa(value.val, subs))
     elseif value isa PhiNode
         # Phi nodes shouldn't appear in structured IR, but handle them gracefully.
         new_values = Vector{Any}(undef, length(value.values))
@@ -75,6 +78,12 @@ function apply_substitutions!(op::IfOp, subs::Substitutions, ctx)
     op.condition = substitute_ssa(op.condition, subs)
     apply_substitutions!(op.then_region, subs, ctx)
     apply_substitutions!(op.else_region, subs, ctx)
+end
+
+function apply_substitutions!(op::TryOp, subs::Substitutions, ctx)
+    op.scope = substitute_ssa(op.scope, subs)
+    apply_substitutions!(op.body, subs, ctx)
+    op.handler === nothing || apply_substitutions!(op.handler, subs, ctx)
 end
 
 function apply_substitutions!(op::ForOp, subs::Substitutions, ctx)
@@ -194,6 +203,11 @@ end
 function substitute_terminator(term::YieldOp, subs::Substitutions)
     new_values = [substitute_ssa(v, subs) for v in term.values]
     return YieldOp(new_values)
+end
+
+function substitute_terminator(term::LeaveOp, subs::Substitutions)
+    new_values = [substitute_ssa(v, subs) for v in term.values]
+    return LeaveOp(new_values)
 end
 
 function substitute_terminator(term::ReturnNode, subs::Substitutions)

@@ -19,13 +19,22 @@ else
 end
 
 """
-    ingest(ir::IRCode) -> MCFG
+    ingest(ir::IRCode; exceptions=:structured) -> MCFG
 
 Convert dense `IRCode` into the explicit-edge mutable form. Leading phi nodes of
 each block become block arguments; the values they carry per predecessor become
 that predecessor edge's operands. Stable ids == original SSA positions.
+
+An `EnterNode` becomes an `MEnter` terminator, and each `Expr(:leave, ...)` is split
+into blocks of its own that pop one handler each (`split_leaves!`). With
+`exceptions=:trap` the handlers are dropped instead: an `EnterNode` without a scope
+becomes a plain fallthrough, its `:leave`s and `UpsilonNode`s go away, and the
+catch blocks become unreachable and are pruned. See `structurize/exceptions.jl`.
 """
-function ingest(ir::IRCode)
+function ingest(ir::IRCode; exceptions::Symbol=:structured)
+    exceptions in (:structured, :trap) ||
+        throw(ArgumentError("exceptions must be :structured or :trap, got :$exceptions"))
+    trap = exceptions === :trap
     di = @static VERSION >= v"1.12-" ? ir.debuginfo : ir.linetable
     nb = length(ir.cfg.blocks)
     blocks = [MBlock() for _ in 1:nb]
@@ -38,6 +47,7 @@ function ingest(ir::IRCode)
 
     # Pass 1: split each block into args / body / terminator. Edges get empty
     # operand vectors here, filled in pass 2.
+    has_eh = false
     for i in 1:nb
         bb = ir.cfg.blocks[i]
         mb = blocks[i]
@@ -48,11 +58,22 @@ function ingest(ir::IRCode)
             loc = _codeloc(ir, si)
             last_loc = loc
             if stmt isa Core.EnterNode
-                # An `EnterNode` is a terminator whose implicit edge to the
-                # catch handler has no structured counterpart; ingesting it as
-                # a plain statement would silently drop the handler block.
-                throw(UnstructuredControlFlowError(
-                    "exception handling is not supported (EnterNode at statement $si)"))
+                # A terminator: falls through into the protected region, with an
+                # implicit edge to the catch block (`_ingest_term`).
+                has_eh = true
+                term_stmt = stmt
+                mb.term_codeloc = loc
+                mb.term_id = si
+            elseif is_leave(stmt)
+                # Keep only the pops of live handlers (an optimized-away enter
+                # leaves a `nothing` argument); under `:trap` only scope enters
+                # survive. `split_leaves!` gives each pop a block of its own.
+                enters = Any[a for a in stmt.args if _live_enter(ir, a, trap)]
+                isempty(enters) && continue
+                push!(mb.body, MStmt(si, Expr(:leave, enters...), ir.stmts.type[si], loc,
+                                     ir.stmts.flag[si]))
+            elseif trap && stmt isa Core.UpsilonNode
+                continue    # feeds only dead handlers
             elseif stmt isa PhiNode
                 push!(mb.args, si)
                 types[si] = ir.stmts.type[si]
@@ -75,7 +96,7 @@ function ingest(ir::IRCode)
         if term_stmt === nothing            # fallthrough block: goto-next, or
             mb.term_codeloc = last_loc      # unreachable dead-end if last (MReturn)
         end
-        mb.term = _ingest_term(term_stmt, i, bb, nb)
+        mb.term = _ingest_term(term_stmt, i, bb, nb, mb.term_id, trap)
     end
 
     # Pass 2: fill each edge's operands from the target block's phi values.
@@ -84,13 +105,40 @@ function ingest(ir::IRCode)
     end
 
     valid_worlds = @static VERSION >= v"1.12-" ? ir.valid_worlds : nothing
-    return MCFG(blocks, 1, types, codelocs,
-                length(ir.stmts.stmt) + 1,
-                copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
+    m = MCFG(blocks, 1, types, codelocs,
+             length(ir.stmts.stmt) + 1,
+             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
+    if has_eh
+        # Drop blocks that no edge reaches (under `:trap`, the catch blocks), so a
+        # dead handler's edges don't feed the continuation it used to join.
+        prune_unreachable!(m)
+        split_leaves!(m)
+        retarget_pop_exceptions!(m)
+        undef_bottom_values!(m)
+    end
+    return m
 end
 
-function _ingest_term(term_stmt, i::Int, bb, nb::Int)
-    if term_stmt isa ReturnNode
+# Whether a `:leave` argument names an enter that is still live (not optimized
+# away to `nothing`), and survives `:trap` (only scope enters do).
+function _live_enter(ir::IRCode, @nospecialize(a), trap::Bool)
+    a isa SSAValue || return false
+    e = ir.stmts.stmt[a.id]
+    e isa Core.EnterNode || return false
+    return !trap || isdefined(e, :scope)
+end
+
+function _ingest_term(term_stmt, i::Int, bb, nb::Int, term_id::Int=0, trap::Bool=false)
+    if term_stmt isa Core.EnterNode
+        # The protected region is the fallthrough block; `catch_dest` is a block
+        # index in `IRCode` (0: scope-only enter, no handler).
+        scope = isdefined(term_stmt, :scope) ? term_stmt.scope : nothing
+        if trap
+            scope === nothing && return MGoto(MEdge(i + 1))
+            return MEnter(term_id, MEdge(i + 1), 0, scope)
+        end
+        return MEnter(term_id, MEdge(i + 1), term_stmt.catch_dest, scope)
+    elseif term_stmt isa ReturnNode
         return isdefined(term_stmt, :val) ? MReturn(term_stmt.val, true) : MReturn()
     elseif term_stmt isa GotoNode
         return MGoto(MEdge(term_stmt.label))
@@ -111,6 +159,10 @@ end
 function _fill_edge_operands!(term::MTerm, i::Int, blocks, phivals, types)
     if term isa MGoto
         _fill_edge!(term.edge, i, blocks, phivals, types)
+    elseif term isa MEnter
+        # The protected region's entry can be a loop header with block args. The
+        # exceptional edge carries none (handler inputs are PhiC/Upsilon).
+        _fill_edge!(term.body, i, blocks, phivals, types)
     elseif term isa MCondBr
         _fill_edge!(term.t, i, blocks, phivals, types)
         _fill_edge!(term.f, i, blocks, phivals, types)

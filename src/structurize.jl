@@ -21,12 +21,22 @@ mutable struct StructurizeCtx
     def_block::Dict{Int, Int}   # ssa id => defining MBlock id (block args + body stmts)
     ssa_remap::Dict{Int, Int}   # original => fresh (for inner defs)
     line_map::Dict{Int, Int}    # ssa_idx => anchor PC/linetable index
+    try_regions::Dict{Int, TryRegion}  # MEnter id => its try region (exceptions.jl)
+    depth::Vector{Int}          # handler-stack depth at each block's entry (-1: unreachable)
 end
 
 function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
     loops = natural_loops_m(m)
+    if has_enter(m)
+        stacks = handler_stacks(m)
+        try_regions = try_info(m, stacks, domtree)
+        depth = handler_depths(stacks)
+    else
+        try_regions = Dict{Int, TryRegion}()
+        depth = zeros(Int, length(m.blocks))
+    end
     # `ctx.types` feeds structural positions (op result / block-arg / Undef types),
     # which must be concrete `Type`s. Widen so a lattice element (e.g. `Core.Const`
     # on a single-literal-edge arg) can't land there. Block-arg and synthesized
@@ -46,7 +56,7 @@ function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
         end
     end
     StructurizeCtx(m, cfg, domtree, loops, m.next_id, 1, types, def_block,
-                   Dict{Int,Int}(), line_map)
+                   Dict{Int,Int}(), line_map, try_regions, depth)
 end
 
 alloc_ssa!(ctx::StructurizeCtx) = (idx = ctx.next_ssa; ctx.next_ssa += 1; idx)
@@ -54,6 +64,8 @@ alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
 
 """Map a synthesized SSA index to the same source location as an existing SSA index."""
 function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
+    # A self-anchor would make `resolve_line` follow the entry forever.
+    new_ssa == source_ssa && return
     haskey(ctx.line_map, source_ssa) || return
     ctx.line_map[new_ssa] = source_ssa  # positive anchor: follow to resolve
 end
@@ -65,8 +77,12 @@ Rebuild `stmt` with every value operand passed through `f` (a value-mapping
 closure). The SSA-substitution primitive shared by `remap_stmt` (the walk),
 `emit` (multiplex), and `assemble_ircode` (unstructurize); each supplies its own
 `f`. Handles every operand-bearing node: `Expr`, `PiNode`, `PhiNode` (unassigned
-slots left unassigned), `GotoIfNot` (cond), `ReturnNode` (val), and a bare
-`SSAValue`. Clones rather than mutates, so shared IR is safe.
+slots left unassigned), `GotoIfNot` (cond), `ReturnNode` (val), `UpsilonNode` (val),
+`PhiCNode` (the upsilons it names), `EnterNode` (scope), and a bare `SSAValue`.
+Clones rather than mutates, so shared IR is safe.
+
+A `PhiCNode`'s operands name `UpsilonNode` statements rather than values, so the
+use scans of normalization skip it (`_mblock_use_ids`).
 """
 function remap_ssa(@nospecialize(stmt), f)
     if stmt isa Expr
@@ -83,6 +99,12 @@ function remap_ssa(@nospecialize(stmt), f)
         return GotoIfNot(f(stmt.cond), stmt.dest)
     elseif stmt isa ReturnNode
         return isdefined(stmt, :val) ? ReturnNode(f(stmt.val)) : stmt
+    elseif stmt isa Core.UpsilonNode
+        return isdefined(stmt, :val) ? Core.UpsilonNode(f(stmt.val)) : stmt
+    elseif stmt isa Core.PhiCNode
+        return Core.PhiCNode(Any[f(v) for v in stmt.values])
+    elseif stmt isa Core.EnterNode
+        return isdefined(stmt, :scope) ? Core.EnterNode(stmt.catch_dest, f(stmt.scope)) : stmt
     elseif stmt isa SSAValue
         return f(stmt)
     else

@@ -27,7 +27,8 @@ the result depends only on CFG topology and dominance.
 function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
                               region_blocks::Set{Int},
-                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing;
+                              depth::Union{Nothing, Vector{Int}}=nothing)
     nblocks = length(cfg.blocks)
 
     then_blocks = Set{Int}()
@@ -56,7 +57,8 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
     # else`. A unique target is the merge; zero targets means both arms diverge;
     # multiple targets is a multi-entry continuation handled by the multiplexer.
     entries, _ = branch_continuation(cfg, domtree, current, true_dest, false_dest,
-                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+                                     then_blocks, else_blocks, region_blocks, loop_ctx;
+                                     depth)
     merge = length(entries) == 1 ? only(entries) : nothing
 
     return then_blocks, else_blocks, merge
@@ -91,12 +93,18 @@ which the outer multiplexer left out of the inner region. So out-of-region
 targets are kept as entries, but loop boundaries (`loop_ctx`) are dropped: a
 back-edge to the header is a continue and an edge out of the loop is a break,
 neither is part of this branch's forward continuation.
+
+`depth` (the handler-stack depth at each block's entry, see `handler_depths`)
+drops try exits the same way: an edge into a block with fewer handlers than
+`current` leaves a try body that encloses the branch, so it becomes a `LeaveOp`
+in the lift rather than a continuation entry.
 """
 function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
                               then_blocks::Set{Int}, else_blocks::Set{Int},
                               region_blocks::Set{Int},
-                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing;
+                              depth::Union{Nothing, Vector{Int}}=nothing)
     nblocks = length(cfg.blocks)
 
     # notContinuation = branch entry ∪ arm regions; continuation = distinct
@@ -125,6 +133,8 @@ function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
                 continue
             end
             dominates(domtree, succ, b) && continue   # back-edge to enclosing header
+            # try exit (a `LeaveOp` in the lift)
+            depth !== nothing && depth[succ] < depth[current] && continue
             if succ ∉ seen
                 push!(seen, succ)
                 push!(entries, succ)
@@ -177,7 +187,13 @@ function merge_info(ctx::StructurizeCtx, merge_idx::Int)
     positions = Int[]; ids = Int[]; types = Any[]
     for (k, arg) in enumerate(args)
         any(p -> (o = edge_operands(m, p, merge_idx); o !== nothing && !(o[k] isa Undef)), preds) || continue
-        push!(positions, k); push!(ids, arg); push!(types, get(ctx.types, arg, Any))
+        T = get(ctx.types, arg, Any)
+        # A `Union{}` arg never holds a value (e.g. a phi of a `PhiCNode` over an
+        # undefined upsilon, read only behind `throw_undef_if_not`), but it can still
+        # be read on a dead path. `Union{}` cannot be a result `Tuple` field, so widen
+        # the slot.
+        T === Union{} && (T = Any)
+        push!(positions, k); push!(ids, arg); push!(types, T)
     end
     isempty(ids) ? nothing : MergeInfo(merge_idx, positions, ids, types)
 end
@@ -373,7 +389,10 @@ end
 (operand on an edge from outside the loop) and carried value (operand on the back
 edge from inside the loop). The single-exiting latch and entry mux guarantee one
 of each, so an argument with only one side is malformed (a dead edge the optimizer
-left, or unexpected loop structure); error rather than emit wrong carries."""
+left, or unexpected loop structure); error rather than emit wrong carries. The one
+exception is an entry edge that carries `Undef`: a variable undefined until the
+loop assigns it (Julia keeps such a variable, guarded by `throw_undef_if_not`,
+around try/catch). It becomes a carry whose initial value is `Undef`."""
 function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     m = ctx.m::MCFG
     result = LoopPhiInfo[]
@@ -381,16 +400,23 @@ function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{In
     for (k, arg) in enumerate(m.blocks[header].args)
         entry_val = nothing
         carried_val = nothing
+        undef_entry = false
         for p in preds
             ops = edge_operands(m, p, header)
             ops === nothing && continue
             v = ops[k]
-            v isa Undef && continue
+            if v isa Undef
+                p ∈ loop_blocks || (undef_entry = true)
+                continue
+            end
             if p ∈ loop_blocks
                 carried_val = v
             else
                 entry_val = v
             end
+        end
+        if entry_val === nothing && carried_val !== nothing && undef_entry
+            entry_val = Undef(get(ctx.types, arg, Any))
         end
         if entry_val !== nothing && carried_val !== nothing
             push!(result, LoopPhiInfo(arg, entry_val, carried_val))
@@ -458,6 +484,7 @@ function loop_escaping_values(ctx::StructurizeCtx, loop_blocks::Set{Int},
         # Body + terminator operands escape only from a non-loop block.
         if bid ∉ loop_blocks
             for s in b.body
+                s.stmt isa Core.PhiCNode && continue   # names upsilons, not values
                 remap_ssa(s.stmt, v -> (consider(v); v))
             end
             t = b.term
@@ -465,12 +492,15 @@ function loop_escaping_values(ctx::StructurizeCtx, loop_blocks::Set{Int},
                 consider(t.cond)
             elseif t isa MReturn
                 t.has_val && consider(t.val)
+            elseif t isa MEnter
+                consider(t.scope)
             end
         end
         # An edge operand escapes when the edge leaves the loop (target ∉ loop):
         # a loop-internal value carried into the non-loop successor's block args.
         t = b.term
-        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) : ()
+        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) :
+                t isa MEnter ? (t.body,) : ()
         for e in edges
             e.target ∈ loop_blocks && continue
             for v in e.args

@@ -43,20 +43,30 @@ end
     validate_scf(sci)  # Should not throw
 end
 
-@testset "exception handling is rejected, not silently dropped" begin
-    # `EnterNode` is a terminator whose catch edge has no structured
-    # counterpart; ingest must reject it outright instead of dropping the
-    # handler block.
+@testset "exception handling is lifted, not silently dropped" begin
+    # An `EnterNode` is a terminator with an implicit edge to its catch block. It
+    # becomes a `TryOp` with the handler as a region, never a plain statement that
+    # would lose the handler block (see exceptions.jl for the shapes).
     trycatch(x) = try; sqrt(x); catch; -1.0; end
-    @test_throws UnstructuredControlFlowError code_structured(trycatch, (Float64,))
+    sci, _ = only(code_structured(trycatch, (Float64,)))
+    @test count(((_, e),) -> e.stmt isa IRStructurizer.TryOp, sci.entry.body) == 1
+    @test execute(sci, 4.0) == 2.0
+    @test execute(sci, -4.0) == -1.0
 
     tryfinally(x) = try; sqrt(x); finally; global _finally_hit = true; end
-    @test_throws UnstructuredControlFlowError code_structured(tryfinally, (Float64,))
+    sci, _ = only(code_structured(tryfinally, (Float64,)))
+    @test count(((_, e),) -> e.stmt isa IRStructurizer.TryOp, sci.entry.body) == 1
+    global _finally_hit = false
+    @test execute(sci, 9.0) == 3.0
+    @test _finally_hit
+    _finally_hit = false
+    @test_throws DomainError execute(sci, -1.0)
+    @test _finally_hit
 
-    # The throw happens at ingest, before any validation pass runs
-    ir, _ = only(code_ircode(trycatch, (Float64,)))
-    @test any(s -> s isa Core.EnterNode, ir.stmts.stmt)
-    @test_throws UnstructuredControlFlowError StructuredIRCode(ir; validate=false)
+    # With `exceptions=:trap` the handlers are dead code and disappear.
+    sci, _ = only(code_structured(trycatch, (Float64,); exceptions=:trap))
+    @test !any(((_, e),) -> e.stmt isa IRStructurizer.TryOp, sci.entry.body)
+    @test execute(sci, 4.0) == 2.0
 end
 
 @testset "validation: invalid terminators" begin

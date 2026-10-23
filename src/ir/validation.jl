@@ -87,10 +87,13 @@ Validation rules:
 - WhileOp before: must have ConditionOp
 - WhileOp after: must have YieldOp
 - LoopOp body: recursively validate nested ops
+- TryOp: body and handler must have explicit terminators; a LeaveOp may only sit
+  inside a TryOp body (through IfOps and inner handlers), never across a loop
 """
 function validate_terminators(sci::StructuredIRCode)
     errors = String[]
     validate_terminators!(errors, sci, sci.entry)
+    validate_leave_placement!(errors, sci.entry, false)
     isempty(errors) || error("internal error: invalid terminators: ",
                               join(errors, "; "))
     return true
@@ -113,6 +116,46 @@ function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, bl
             validate_while_terminators!(errors, sci, stmt, idx)
         elseif stmt isa LoopOp
             validate_loop_terminators!(errors, sci, stmt, idx)
+        elseif stmt isa TryOp
+            validate_try_terminators!(errors, sci, stmt, idx)
+        end
+    end
+end
+
+function validate_try_terminators!(errors::Vector{String}, sci::StructuredIRCode,
+                                   op::TryOp, idx::Int)
+    for (name, b) in (("body", op.body), ("handler", op.handler))
+        b === nothing && continue
+        b.terminator === nothing &&
+            push!(errors, "TryOp at %$idx: $name must have explicit terminator, got nothing")
+        b.terminator isa Union{ContinueOp, BreakOp, ConditionOp} &&
+            push!(errors, "TryOp at %$idx: $name cannot end in $(typeof(b.terminator))")
+        validate_terminators!(errors, sci, b)
+    end
+    if op.handler !== nothing && length(op.upsilons) != length(op.handler.args)
+        push!(errors, "TryOp at %$idx: $(length(op.upsilons)) upsilon lists for $(length(op.handler.args)) handler arguments")
+    end
+end
+
+# A LeaveOp exits the innermost enclosing TryOp body. It may sit in nested IfOp
+# arms and inner TryOp handlers, but loops and inner try bodies are boundaries.
+function validate_leave_placement!(errors::Vector{String}, block::Block, in_try::Bool)
+    if block.terminator isa LeaveOp && !in_try
+        push!(errors, "LeaveOp outside a TryOp body")
+    end
+    for (idx, entry) in block.body
+        stmt = entry.stmt
+        if stmt isa TryOp
+            validate_leave_placement!(errors, stmt.body, true)
+            stmt.handler === nothing || validate_leave_placement!(errors, stmt.handler, in_try)
+        elseif stmt isa IfOp
+            for b in blocks(stmt)
+                validate_leave_placement!(errors, b, in_try)
+            end
+        elseif stmt isa ControlFlowOp
+            for b in blocks(stmt)
+                validate_leave_placement!(errors, b, false)
+            end
         end
     end
 end
@@ -315,8 +358,25 @@ function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}
 end
 
 function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, expr::Expr)
+    # `pop_exception`'s operand names a TryOp, whose exception-stack depth it
+    # restores. It is a token, not a value: after an outer try is left first, it
+    # can name an inner TryOp nested in that outer body.
+    expr.head === :pop_exception && return
     for arg in expr.args
         arg isa SSAValue && check_use!(scope_stack, violations, arg)
+    end
+end
+
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, node::Core.UpsilonNode)
+    isdefined(node, :val) && check_use!(scope_stack, violations, node.val)
+end
+
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::TryOp)
+    check_use!(scope_stack, violations, op.scope)
+    for b in blocks(op)
+        push!(scope_stack, Set{Int}())
+        validate_ssa_defs_scoped!(scope_stack, violations, b)
+        pop!(scope_stack)
     end
 end
 
@@ -387,7 +447,7 @@ function check_terminator_uses!(::Vector{Set{Int}}, ::Vector{Int}, term)
     # nothing terminator or unrecognized: no uses.
 end
 
-function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::Union{YieldOp, ContinueOp, BreakOp})
+function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::Union{YieldOp, ContinueOp, BreakOp, LeaveOp})
     for v in term.values
         check_use!(scope_stack, violations, v)
     end

@@ -9,6 +9,9 @@
 _term_targets(t::MGoto) = (t.edge.target,)
 _term_targets(t::MCondBr) = (t.t.target, t.f.target)
 _term_targets(t::MReturn) = ()
+# Both edges of an enter are CFG edges (dominance, loops, reachability see the
+# handler), but neither is ever redirected: `_edge_refs_of`/`edge_refs` expose none.
+_term_targets(t::MEnter) = t.catch_dest == 0 ? (t.body.target,) : (t.body.target, t.catch_dest)
 
 """A lightweight `CFG` over the mutable blocks (preds/succs only; statement
 ranges are placeholders) for dominance / SCC queries during normalization. Block
@@ -39,6 +42,9 @@ function normalize_one_irreducible!(m::MCFG)
 
     by_scc = Dict{Int, Vector{Int}}()
     for bb in 1:nb
+        # `reach.irreducible` is only written for reachable blocks (it is allocated
+        # uninitialized), so skip unreachable ones.
+        CC.bb_unreachable(reach, bb) && continue
         CC.bb_in_irreducible_loop(reach, bb) && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
     end
     isempty(by_scc) && return false
@@ -73,7 +79,12 @@ end
 # single-exiting latch ---------------------------------------------------------
 
 """Natural loops on the MBlock CFG: header id to set of in-loop block ids. A back
-edge is `src->header` where `header` dominates `src`."""
+edge is `src->header` where `header` dominates `src`.
+
+A loop that contains an `MEnter` also contains that try's whole protected region
+and handler (`extend_loops_over_trys!`), so a throwing dead end in the region, or
+a handler that leaves the loop, stays inside the `TryOp` instead of becoming a
+loop exit that the latch would hoist out of the try."""
 function natural_loops_m(m::MCFG)
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
@@ -93,12 +104,14 @@ function natural_loops_m(m::MCFG)
             end
         end
     end
+    has_enter(m) && extend_loops_over_trys!(loops, m)
     return loops
 end
 
 _edge_refs_of(src::Int, t::MGoto)   = (EdgeRef(src, :goto),)
 _edge_refs_of(src::Int, t::MCondBr) = (EdgeRef(src, :t), EdgeRef(src, :f))
 _edge_refs_of(src::Int, t::MReturn) = ()
+_edge_refs_of(src::Int, t::MEnter)  = ()
 
 """Route a loop's back edges and exit edges through one latch (MLIR's
 `createSingleExitingLatch`). Back edges carry `shouldRepeat=1`, exit edges `=0`;
@@ -144,6 +157,8 @@ function _mblock_use_ids(b::MBlock)
     ids = Int[]
     collect_ssa(@nospecialize(v)) = (v isa SSAValue && push!(ids, v.id); v)
     for s in b.body
+        # A PhiC's operands name UpsilonNode statements (tokens), not values.
+        s.stmt isa Core.PhiCNode && continue
         remap_ssa(s.stmt, collect_ssa)
     end
     t = b.term
@@ -155,6 +170,9 @@ function _mblock_use_ids(b::MBlock)
         for v in t.f.args; v isa SSAValue && push!(ids, v.id); end
     elseif t isa MReturn
         t.has_val && t.val isa SSAValue && push!(ids, t.val.id)
+    elseif t isa MEnter
+        t.scope isa SSAValue && push!(ids, t.scope.id)
+        for v in t.body.args; v isa SSAValue && push!(ids, v.id); end
     end
     return ids
 end
@@ -163,6 +181,7 @@ end
 # terminator operands, and outgoing-edge operands. Mirrors `_mblock_use_ids`.
 function _rewrite_mblock!(b::MBlock, f)
     for (i, s) in enumerate(b.body)
+        s.stmt isa Core.PhiCNode && continue   # upsilon tokens, not values
         b.body[i] = MStmt(s.id, remap_ssa(s.stmt, f), s.type, s.codeloc, s.flag)
     end
     t = b.term
@@ -174,6 +193,9 @@ function _rewrite_mblock!(b::MBlock, f)
         b.term = MCondBr(f(t.cond), t.t, t.f)
     elseif t isa MReturn
         t.has_val && (b.term = MReturn(f(t.val), true))
+    elseif t isa MEnter
+        t.scope === nothing || (t.scope = f(t.scope))
+        for k in eachindex(t.body.args); t.body.args[k] = f(t.body.args[k]); end
     end
 end
 
@@ -332,15 +354,19 @@ function normalize_one_continuation!(m::MCFG)
     domtree = construct_domtree(cfg)
     loops = natural_loops_m(m)
     all_blocks = Set(1:length(m.blocks))
+    # Edges that leave a try body enclosing the branch become `LeaveOp`s in the
+    # lift, not continuation entries; `depth` lets `branch_continuation` skip them.
+    depth = has_enter(m) ? handler_depths(m) : nothing
     for E in 1:length(m.blocks)
         t = m.blocks[E].term
         t isa MCondBr || continue
         true_dest, false_dest = t.t.target, t.f.target
         lctx = enclosing_loop_ctx(loops, E)
         then_blocks, else_blocks, _ =
-            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx)
+            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx; depth)
         entries, notcont = branch_continuation(cfg, domtree, E, true_dest, false_dest,
-                                               then_blocks, else_blocks, all_blocks, lctx)
+                                               then_blocks, else_blocks, all_blocks, lctx;
+                                               depth)
         length(entries) > 1 || continue
 
         # The continuation edges: every edge from a branch-region block (notcont)
@@ -409,12 +435,16 @@ function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
-    while normalize_one_irreducible!(m) || normalize_one_loop_latch!(m) ||
-          normalize_one_continuation!(m) || normalize_one_preheader!(m)
+    # Try regions go first: once each `TryOp` has a single continuation, the other
+    # passes only ever redirect edges between blocks that hold the same handlers.
+    while normalize_one_try!(m) || normalize_one_irreducible!(m) ||
+          normalize_one_loop_latch!(m) || normalize_one_continuation!(m) ||
+          normalize_one_preheader!(m)
         changed = true
         guard += 1
         guard > 8 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
     end
+    has_enter(m) && verify_try_structure(m)
     return changed
 end
 
@@ -427,8 +457,8 @@ the lift only structurizes single-entry regions. One `ingest`, then one mutate
 fixpoint over the `MCFG`; the lift (`lift_mcfg`) reads the returned `MCFG`
 directly.
 """
-function normalize_cf(ir::IRCode)
-    m = ingest(ir)
+function normalize_cf(ir::IRCode; exceptions::Symbol=:structured)
+    m = ingest(ir; exceptions)
     normalize_cf!(m)
     return m
 end
