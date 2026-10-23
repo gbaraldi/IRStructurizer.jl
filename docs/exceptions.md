@@ -464,9 +464,10 @@ may instead end in the first exception the direct call throws.
 - a try in a `while` condition
 - ScopedValues `@with`, including the scope-only `EnterNode(0, scope)`
 
+- ScopedValue reads inlined into the function (not hidden behind `@noinline`)
+
 The battery outside the test suite also covers a try returning a `Union`
-(`p3`). That shape round-trips only with `validate=false`; see the limitations
-below.
+(`p3`).
 
 Beyond the hand-written shapes, every Base/stdlib method with a concrete
 signature was swept. 77 of them have an `EnterNode` after optimization:
@@ -487,11 +488,6 @@ signature was swept. 77 of them have an `EnterNode` after optimization:
   lowered `IRCode` may fail Julia's dominance check.
 - Outputs can be verbose: a try with several exit kinds gets a discriminator
   dispatch after it, as multi-exit loops already do.
-- Pre-existing and independent of EH, but common in EH code: Julia sometimes types
-  a phi narrower than its incoming values. Examples are a `ScopedValue[]` read
-  inlined into the function, and a try returning `Union{Nothing,Int}` read behind
-  a guard. `validate_terminators`' yield-type check rejects these on `main` too.
-  The structured IR is correct and round-trips with `validate=false`.
 - The try analyses are recomputed on every normalization step. That is cheap for
   ordinary functions and quadratic-ish in the number of trys for huge ones. Code
   without trys does no extra work.
@@ -508,6 +504,13 @@ EH-specific)
   which made `source_location` (and printing) loop forever.
 - `merge_info` widens a `Union{}`-typed merge argument's result slot to `Any`.
   `Union{}` cannot be a `Tuple` field.
+- Julia types a phi by what inference knows on each incoming edge, so a phi can be
+  narrower than the value feeding it. Examples are an inlined `ScopedValue[]` read,
+  a try returning `Union{Nothing,Int}` read behind a guard, and `x::Any` behind
+  `x isa Int`. Julia's verifier allows this, but the yield then failed
+  `validate_terminators`' type check, on `main` too. `merge_values` now narrows such
+  an operand with a `PiNode` in the region that takes the edge, where the refinement
+  holds.
 
 ## 7. Future work
 

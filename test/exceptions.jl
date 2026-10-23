@@ -386,6 +386,10 @@ function eh_lazy(n)   # a variable first defined in a catch: undefined on loop e
 end
 eh_scoped(x) = @with EH_SV => x begin; eh_readsv() + eh_g(x) end
 eh_scope_only(x) = @with EH_SV => x begin; x + 1 end   # nothrow body: EnterNode(0, scope)
+# Inlined ScopedValue reads: the phi of the read is narrower than the value
+# feeding it (an `Any` yield into an `Int` slot unless narrowed).
+eh_scoped_inline(x) = @with EH_SV => x begin; EH_SV[] + eh_g(x) end
+eh_scoped_inline_try(x) = try @with EH_SV => x begin; eh_g(EH_SV[]) end catch; EH_SV[] end
 # Nested exceptions of one type: only the message tells them apart.
 function eh_same_type(x)
     try
@@ -413,6 +417,7 @@ const EH_CASES = [
     (eh_try_in_catch, (0, 5, 15)), (eh_three_levels, (1, 5, 9, 15)),
     (eh_sequential, (1, 3, 20)), (eh_goto_out, (1, 7, 20)), (eh_lazy, (0, 5, 15)),
     (eh_scoped, (3, 20)), (eh_scope_only, (3, 20)),
+    (eh_scoped_inline, (3, 20)), (eh_scoped_inline_try, (3, 20)),
     (eh_same_type, (1, 7, 12)),
 ]
 

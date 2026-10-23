@@ -431,12 +431,35 @@ function merge_values(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::M
         if v isa Undef
             push!(vals, Undef(minfo.types[j]))
         else
-            v = remap_ssa_ref(v, ctx.ssa_remap)
             idx = get(ctx.ssa_remap, minfo.ids[j], minfo.ids[j])
-            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) : v)
+            push!(vals, haskey(blk.body, idx) ? SSAValue(idx) :
+                        narrow_edge_value!(blk, ctx, v, minfo.types[j], minfo.ids[j]))
         end
     end
     return vals
+end
+
+"""The edge operand `v`, remapped, for a merge slot of type `T`. Julia types a phi
+by what inference knows on each incoming edge, so the phi can be narrower than the
+value: `x::Any` reaching it from behind an `x isa Int` check feeds an `Int` phi.
+Julia's verifier allows that, but a yield must fit its result slot. So a wider
+operand is narrowed with a `PiNode` in `blk`, the region that takes the edge, where
+the refinement holds."""
+function narrow_edge_value!(blk::Block, ctx::StructurizeCtx, @nospecialize(v),
+                            @nospecialize(T), anchor::Int)
+    S = if v isa SSAValue
+        get(ctx.types, v.id, Any)
+    elseif v isa Argument
+        widenconst((ctx.m::MCFG).argtypes[v.n])
+    else
+        return v                  # a constant: inference typed the phi from it
+    end
+    v = remap_ssa_ref(v, ctx.ssa_remap)
+    S <: T && return v
+    pi = alloc_ssa!(ctx)
+    push!(blk, pi, PiNode(v, T), T)
+    anchor_line!(ctx, pi, anchor)
+    return SSAValue(pi)
 end
 
 """The arm's exit block: the seed (in `blocks`, else the branch source `fallback`)
