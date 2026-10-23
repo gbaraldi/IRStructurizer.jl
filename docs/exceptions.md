@@ -436,13 +436,18 @@ and type filtering is ordinary code in the handler followed by `rethrow`.
 ## 6. Prototype status
 
 **Handled** (each is round-tripped by `test/exceptions.jl` with and without loop
-promotion and under `:trap`, on throwing and non-throwing inputs):
+promotion and under `:trap`, on throwing and non-throwing inputs). The lowered code
+must pass `verify_ir`, and every run must match the direct call. That covers the
+result or exception (type and message), the side-effect log (cleanup that runs
+once, in order), and the exception-stack depth after a return. Under `:trap` a run
+may instead end in the first exception the direct call throws.
 
 - try/catch
 - catch with `e` (`the_exception`)
 - try/finally
 - try/catch/finally with `return` in each part
 - rethrow, including conditional rethrow
+- nested exceptions of one type, told apart by message
 - values live into the catch (upsilon/phic)
 - nested trys, three levels deep
 - a try inside a catch

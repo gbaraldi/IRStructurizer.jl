@@ -2,39 +2,97 @@
  Exception handling: EnterNode / :leave / PhiC+Upsilon to TryOp / LeaveOp.
 
  Every shape round-trips (structurize, unstructurize, execute) on inputs that do
- and don't throw, with the thrown exception compared by type. Structural tests pin
- the TryOp shape: handler block args from PhiC, LeaveOp from nested exits, a single
- continuation, the scope operand, and `exceptions=:trap`.
+ and don't throw, comparing results, thrown exceptions (type and message), the
+ `eh_log` side effects, and the exception-stack depth (`eh_check`). Structural
+ tests pin the TryOp shape: handler block args from PhiC, LeaveOp from nested exits,
+ a single continuation, the scope operand, and `exceptions=:trap`.
 =============================================================================#
 
 using IRStructurizer: TryOp, LeaveOp
 using Base.ScopedValues
 
-@noinline eh_g(x::Int) = x > 10 ? error("big") : x + 1
-@noinline eh_h(x::Int) = x < 0 ? throw(DomainError(x)) : x * 2
-const EH_LOG = Int[]
-@noinline eh_log(x) = (push!(EH_LOG, x); nothing)
+const EH_LOG = Any[]
+@noinline eh_log(@nospecialize(x)) = (push!(EH_LOG, x); nothing)
+# An exception, comparable across runs: its type and message.
+eh_payload(@nospecialize(e)) = (typeof(e), sprint(showerror, e))
+"""Throw `e`, logging it first. The test functions throw through this, so a log
+also records the throws that a handler catches."""
+@noinline eh_throw(@nospecialize(e)) = (push!(EH_LOG, (:throw, eh_payload(e))); throw(e))
+@noinline eh_g(x::Int) = x > 10 ? eh_throw(ErrorException("big")) : x + 1
+@noinline eh_h(x::Int) = x < 0 ? eh_throw(DomainError(x)) : x * 2
 const EH_SV = ScopedValue(1)
 @noinline eh_readsv() = EH_SV[]
 
-# Result of a call, or the type of what it threw.
-eh_outcome(f, args...) = try f(args...) catch e; typeof(e) end
-
-"""Structurize `f` at `Tuple{Int}`, unstructurize, and run on every input; compare
-to the direct call (values with `isequal`, a throw by exception type). Under
-`exceptions=:trap` a throw that a handler would have caught escapes instead, so
-only inputs where the lowered code returns are compared."""
-function eh_roundtrip(f, inputs; exceptions=:structured, promote=true)
-    ir, _ = only(code_ircode(f, (Int,)))
-    sci = StructuredIRCode(ir; exceptions, promote)
-    for x in inputs
-        expected = eh_outcome(f, x)
-        got = eh_outcome(execute, sci, x)
-        exceptions === :trap && got isa Type && continue
-        isequal(expected, got) || return false
+"""The outcome of a call: `(:ok, value)` or `(:threw, payload)`, the `eh_log` calls it
+made, and the exception-stack depth after a normal return (-1 after a throw). A
+lost or mistargeted `pop_exception` leaves exceptions on the stack."""
+function eh_outcome(f, args...)
+    empty!(EH_LOG)
+    depth = -1
+    result = try
+        v = f(args...)
+        depth = length(current_exceptions())
+        (:ok, v)
+    catch e
+        (:threw, eh_payload(e))
     end
-    return true
+    return (; result, log = copy(EH_LOG), depth)
 end
+
+"""Lower `sci` back to `IRCode`, check it with `verify_ir`, and compile it. This
+runs outside `eh_outcome`, so a lowering failure is a test error, never an
+exception that `:trap` mode would skip."""
+function eh_lower(sci::StructuredIRCode)
+    ir = CC.IRCode(sci)
+    CC.verify_ir(ir)
+    ir = CC.copy(ir)
+    ir.argtypes[1] = Tuple{}
+    @static if VERSION >= v"1.12-"
+        ir.debuginfo.def = Symbol("unstructurized")
+    end
+    return Core.OpaqueClosure(ir)
+end
+
+"""
+    eh_check(f, inputs; exceptions=:structured, promote=true, argtypes, optimize_until,
+             internal_throws=false) -> Vector{String}
+
+Structurize `f` (at the types of the first input tuple, or `argtypes`), lower it
+back with `eh_lower`, and run it on every input tuple. Each outcome must equal the
+direct call's (`eh_outcome`). Under `exceptions=:trap` a handler that would have
+caught the first throw is gone, so a run may end in that throw instead: its log
+must match the direct call's up to and including that throw, which `eh_throw`
+logged. With `internal_throws`, the throw may also come from Julia itself (not
+`eh_throw`). Returns the mismatches.
+"""
+function eh_check(f, inputs; exceptions=:structured, promote=true,
+                  argtypes=Tuple{map(typeof, first(inputs))...},
+                  optimize_until=nothing, internal_throws=false)
+    ir, _ = only(code_ircode(f, argtypes; optimize_until))
+    sci = StructuredIRCode(ir; exceptions, promote)
+    return eh_compare(f, eh_lower(sci), inputs; exceptions, internal_throws)
+end
+
+"""Run the lowered closure `oc` and `f` on every input, as `eh_check` describes."""
+function eh_compare(f, oc, inputs; exceptions=:structured, internal_throws=false)
+    problems = String[]
+    for args in inputs
+        expected = eh_outcome(f, args...)
+        got = eh_outcome(oc, args...)
+        isequal(expected, got) && continue
+        if exceptions === :trap && got.result[1] === :threw
+            n = length(got.log)
+            isequal(got.log, expected.log[1:min(n, end)]) &&
+                (internal_throws || (n > 0 && isequal(got.log[n], (:throw, got.result[2])))) &&
+                continue
+        end
+        push!(problems, "$(nameof(f))$(args): expected $(expected), got $(got)")
+    end
+    return problems
+end
+
+"""`eh_check` at `Tuple{Int}`, on single-integer inputs."""
+eh_roundtrip(f, inputs; kwargs...) = eh_check(f, [(x,) for x in inputs]; kwargs...)
 
 function eh_ops(blk::Block, T)
     found = Any[]
@@ -133,7 +191,7 @@ function eh_dead_merge(x)   # an exit next to a throwing merge inside the try
         else
             z = 2
         end
-        error("boom $z")
+        eh_throw(ErrorException("boom $z"))
     catch
         -9
     end
@@ -204,7 +262,7 @@ function eh_throw_in_loop_in_try(n)
     try
         s = 0
         for i in 1:n
-            i == 7 && throw(ArgumentError("seven"))
+            i == 7 && eh_throw(ArgumentError("seven"))
             s += i
         end
         s
@@ -218,7 +276,7 @@ function eh_throw_in_try_in_loop(n)
     while i < n
         i += 1
         try
-            i == 3 && throw(ArgumentError("three"))
+            i == 3 && eh_throw(ArgumentError("three"))
             s += i
         catch
             s -= 100
@@ -328,6 +386,20 @@ function eh_lazy(n)   # a variable first defined in a catch: undefined on loop e
 end
 eh_scoped(x) = @with EH_SV => x begin; eh_readsv() + eh_g(x) end
 eh_scope_only(x) = @with EH_SV => x begin; x + 1 end   # nothrow body: EnterNode(0, scope)
+# Nested exceptions of one type: only the message tells them apart.
+function eh_same_type(x)
+    try
+        try
+            eh_throw(ErrorException("inner $x"))
+        catch
+            x > 5 && eh_throw(ErrorException("outer $x"))
+            rethrow()
+        end
+    catch e
+        x > 10 && rethrow()
+        (e::ErrorException).msg
+    end
+end
 
 const EH_CASES = [
     (eh_basic, (1, 20)), (eh_exc, (1, 20)), (eh_finally, (1, 20)), (eh_nested, (1, 5, 20)),
@@ -341,14 +413,15 @@ const EH_CASES = [
     (eh_try_in_catch, (0, 5, 15)), (eh_three_levels, (1, 5, 9, 15)),
     (eh_sequential, (1, 3, 20)), (eh_goto_out, (1, 7, 20)), (eh_lazy, (0, 5, 15)),
     (eh_scoped, (3, 20)), (eh_scope_only, (3, 20)),
+    (eh_same_type, (1, 7, 12)),
 ]
 
 @testset "exceptions" begin
 
 @testset "round trip: $(nameof(f))" for (f, inputs) in EH_CASES
-    @test eh_roundtrip(f, inputs)
-    @test eh_roundtrip(f, inputs; promote=false)
-    @test eh_roundtrip(f, inputs; exceptions=:trap)
+    @test isempty(eh_roundtrip(f, inputs))
+    @test isempty(eh_roundtrip(f, inputs; promote=false))
+    @test isempty(eh_roundtrip(f, inputs; exceptions=:trap))
 end
 
 @testset "TryOp shape: body, handler, results" begin
@@ -416,7 +489,7 @@ end
     sci2, _ = only(code_structured(eh_dead_merge, Tuple{Int}))
     op2 = only(eh_ops(sci2, TryOp))
     @test eh_terminators(op2.body, LeaveOp) == 1
-    @test op2.body.terminator == ReturnNode()   # error() ends the body
+    @test op2.body.terminator == ReturnNode()   # the throw ends the body
 end
 
 @testset "multi-handler leave and pop_exception after an outer leave" begin
