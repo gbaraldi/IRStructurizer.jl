@@ -943,4 +943,96 @@ end
     end
 end
 
+@testset "loop escape arguments are fed only where they can be read" begin
+    # `reduce_loop!` adds a latch argument for every loop-internal value used
+    # after the loop. Lists, per single-exiting latch of the normalized MCFG, every
+    # edge into it as its source block, the `shouldRepeat` operand and the
+    # operands for those escape arguments (the latch args after `shouldRepeat`).
+    function latch_edges(m)
+        res = []
+        for (L, b) in enumerate(m.blocks)
+            t = b.term
+            t isa IRStructurizer.MCondBr && t.cond isa SSAValue || continue
+            i = findfirst(s -> s.id == t.cond.id, b.body)
+            i === nothing && continue
+            st = b.body[i].stmt
+            (Meta.isexpr(st, :call) && st.args[1] === Core.:(===) && st.args[3] === 1 &&
+             st.args[2] isa SSAValue && st.args[2].id in b.args) || continue
+            srpos = findfirst(==(st.args[2].id), b.args)
+            edges = []
+            for src in 1:length(m.blocks), r in IRStructurizer.edge_refs(m, src, L)
+                e = IRStructurizer.edge_of(m, r)
+                push!(edges, (; src, sr=e.args[srpos], escapes=e.args[srpos+1:end]))
+            end
+            push!(res, (; header=t.t.target, edges))
+        end
+        return res
+    end
+    isundef(x) = x isa IRStructurizer.Undef
+    latch_of(ir) = only(latch_edges(IRStructurizer.normalize_cf(ir)))
+
+    # Early returns read the iteration-start `z`/`out` (header phis), the normal
+    # exit reads the updated ones. No escape argument is read after a back edge.
+    function newton(x, z)
+        out = x*z - 1.0
+        isfinite(out) || return z, out, false
+        for _ in 1:100
+            abs(out) < 1e6 || return z, out, false
+            dz = out / x
+            abs(dz) < 1e-12 && return z - dz, x*(z - dz) - 1.0, true
+            z = z - dz
+            out = x*z - 1.0
+        end
+        return z, out, false
+    end
+    ir, _ = only(code_ircode(newton, Tuple{Float64, Float64}))
+    l = latch_of(ir)
+    back = filter(e -> e.sr === 1, l.edges)
+    exits = filter(e -> e.sr === 0, l.edges)
+    @test length(back) == 1 && length(exits) == 3
+    @test all(e -> all(isundef, e.escapes), back)
+    @test all(e -> any(!isundef, e.escapes), exits)
+    sci, _ = code_structured(newton, Tuple{Float64, Float64}) |> only
+    for (x, z) in ((2.0, 1.0), (2.0, 0.5), (1e-9, 1e10), (0.0, Inf), (3.0, 1e8))
+        @test isequal(execute(sci, x, z), newton(x, z))
+    end
+
+    # Two back edges (B5→B2, B6→B2) and two exits: B2→B3 returns `i+1` (%3),
+    # bottom-tested B6→B7 returns `(i+1)^2` (%11). Julia source merges `continue`
+    # paths into one back edge, so this is built by hand.
+    two_back_ir() = build_ir([
+        (stmts=[(GotoNode(2), Any)], succs=[2]),                                   # B1
+        (stmts=[(PhiNode(Int32[1, 5, 6], Any[0, SSAValue(3), SSAValue(3)]), Int),   # B2: i
+                (Expr(:call, Core.Intrinsics.add_int, SSAValue(2), 1), Int),        #  %3 = i+1
+                (Expr(:call, Core.Intrinsics.slt_int, Argument(2), SSAValue(3)), Bool),
+                (GotoIfNot(SSAValue(4), 4), Any)],                  succs=[4, 3]),
+        (stmts=[(ReturnNode(SSAValue(3)), Any)],                    succs=Int[]),  # B3
+        (stmts=[(Expr(:call, Core.Intrinsics.and_int, SSAValue(3), 1), Int),        # B4
+                (Expr(:call, Core.:(===), SSAValue(7), 0), Bool),
+                (GotoIfNot(SSAValue(8), 6), Any)],                  succs=[6, 5]),
+        (stmts=[(GotoNode(2), Any)],                                succs=[2]),    # B5
+        (stmts=[(Expr(:call, Core.Intrinsics.mul_int, SSAValue(3), SSAValue(3)), Int),  # B6
+                (Expr(:call, Core.Intrinsics.slt_int, Argument(3), SSAValue(11)), Bool),
+                (GotoIfNot(SSAValue(12), 2), Any)],                 succs=[2, 7]),
+        (stmts=[(ReturnNode(SSAValue(11)), Any)],                   succs=Int[]),  # B7
+    ], Any[Any, Int, Int])
+    function two_back_ref(n, m)
+        i = 0
+        while true
+            i += 1
+            n < i && return i
+            isodd(i) && m < i*i && return i*i
+        end
+    end
+    l = latch_of(two_back_ir())
+    back = filter(e -> e.sr === 1, l.edges)
+    @test sort([e.src for e in back]) == [5, 6]
+    @test all(e -> all(isundef, e.escapes), back)
+    @test all(e -> any(!isundef, e.escapes), filter(e -> e.sr === 0, l.edges))
+    sci = StructuredIRCode(two_back_ir())
+    for n in (0, 1, 4, 10), m in (0, 5, 30, 1000)
+        @test execute(sci, n, m) == two_back_ref(n, m)
+    end
+end
+
 end  # regression suite

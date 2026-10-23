@@ -179,8 +179,11 @@ end
 
 """Reduce form (the latch-arg half of MLIR's `transformToReduceLoop`). For every
 value defined inside the loop and used outside it, add a latch block argument fed
-`value`-or-`undef` from each latch predecessor by dominance, and rewrite the
-outside uses to that latch arg. After this every loop-internal value read
+`value`-or-`undef` from each exit edge by dominance, and rewrite the outside uses
+to that latch arg. The back edges (`back_refs`) feed `undef`: the latch arg only
+serves uses outside the loop, so the value it carries around to the next
+iteration is never read, and passing the iteration's value there would keep it
+alive across the back edge for nothing. After this every loop-internal value read
 downstream is a latch block arg, so the lift threads it out as a `BreakOp` result
 with no escape scan. `LoopOp` has separate `Break`/`Continue` values, so only this
 latch-arg half is needed: no header arg, no exit-block arg.
@@ -188,7 +191,8 @@ latch-arg half is needed: no header arg, no exit-block arg.
 Excludes the latch's own block args (the mux slices and discriminator already
 become loop results through the post-loop dispatch). `loop_blocks` must include
 `latch`."""
-function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
+function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int},
+                      back_refs::Vector{EdgeRef})
     domtree = construct_domtree(build_cfg(m))
 
     # Definition site and type of each SSA id. Block-arg types live in `m.types`;
@@ -232,7 +236,8 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int})
         dv = def_block[v]
         for ref in pred_refs
             e = edge_of(m, ref)
-            push!(e.args, dominates(domtree, dv, ref.src) ? SSAValue(v) : Undef(T))
+            feed = !(ref in back_refs) && dominates(domtree, dv, ref.src)
+            push!(e.args, feed ? SSAValue(v) : Undef(T))
         end
         fv(@nospecialize(w)) = (w isa SSAValue && w.id == v) ? SSAValue(larg) : w
         for bid in 1:length(m.blocks)
@@ -259,7 +264,7 @@ function normalize_one_loop_latch!(m::MCFG)
         end
         (length(exit_refs) >= 2 || length(back_refs) >= 2) || continue
         mux = single_exiting_latch!(m, h, back_refs, exit_refs)
-        reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))))
+        reduce_loop!(m, h, mux.mux_id, union(body, Set((mux.mux_id,))), back_refs)
         return true
     end
     return false
