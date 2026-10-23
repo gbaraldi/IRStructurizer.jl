@@ -617,6 +617,34 @@ end
     end
 end
 
+@testset "validation rejects malformed TryOps" begin
+    invalid(sci) = try validate_terminators(sci); "" catch e; e.msg end
+    fresh(f) = first(only(code_structured(f, Tuple{Int})))
+    sci = fresh(eh_basic)
+    @test validate_terminators(sci)
+    # The body yield must carry the op's one result, of its type.
+    op = only(eh_ops(sci, TryOp))
+    op.body.terminator = YieldOp()
+    @test occursin("body yield carries 0 values", invalid(sci))
+    op.body.terminator = YieldOp(Any["str"])
+    @test occursin("not <: declared Int64", invalid(sci))
+    # A value return inside the body would skip the leave.
+    op.body.terminator = ReturnNode(42)
+    @test occursin("value return inside the body", invalid(sci))
+    # A LeaveOp out of a nested arm carries the op's results too.
+    sci = fresh(eh_mixed_exit)
+    op = only(eh_ops(sci, TryOp))
+    leave = only(b for b in IRStructurizer.eachblock(op.body) if b.terminator isa LeaveOp)
+    leave.terminator = LeaveOp(leave.terminator.values[1:end-1])
+    @test occursin("leave carries", invalid(sci))
+    # Upsilons name UpsilonNode statements.
+    sci = fresh(eh_upsilon)
+    op = only(eh_ops(sci, TryOp))
+    notups = first(i for (i, e) in op.body.body if !(e.stmt isa Core.UpsilonNode))
+    push!(op.upsilons[1], notups)
+    @test occursin("is not an UpsilonNode", invalid(sci))
+end
+
 @testset "unsupported shapes are rejected" begin
     # The catch block is also reached by ordinary control flow (after a leave).
     ir = build_ir([

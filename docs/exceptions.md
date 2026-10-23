@@ -183,7 +183,10 @@ end
 `LeaveOp(values)` exits the innermost enclosing `TryOp` *body* and continues after
 the op with `values` as its results. It can cross `IfOp` arms and the handler of an
 inner `TryOp` (whose handler is already popped). It never crosses a loop or another
-try body. `validate_terminators` checks this.
+try body. `validate_terminators` checks this. It also checks that the body and
+handler yields and every `LeaveOp` that exits the body carry the op's results
+(arity and types), that no value `return` sits inside a body, and that each listed
+upsilon is an `UpsilonNode`.
 
 | exit | structured form | Julia IR (unstructurize) | Wasm |
 |---|---|---|---|

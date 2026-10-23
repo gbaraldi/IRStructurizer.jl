@@ -88,12 +88,16 @@ Validation rules:
 - WhileOp after: must have YieldOp
 - LoopOp body: recursively validate nested ops
 - TryOp: body and handler must have explicit terminators; a LeaveOp may only sit
-  inside a TryOp body (through IfOps and inner handlers), never across a loop
+  inside a TryOp body (through IfOps and inner handlers), never across a loop;
+  the body and handler yields and the LeaveOps that exit the body carry the op's
+  results (arity and types); no value return inside the body; every listed upsilon
+  is an UpsilonNode
 """
 function validate_terminators(sci::StructuredIRCode)
     errors = String[]
     validate_terminators!(errors, sci, sci.entry)
     validate_leave_placement!(errors, sci.entry, false)
+    validate_try_upsilons!(errors, sci)
     isempty(errors) || error("internal error: invalid terminators: ",
                               join(errors, "; "))
     return true
@@ -117,13 +121,13 @@ function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, bl
         elseif stmt isa LoopOp
             validate_loop_terminators!(errors, sci, stmt, idx)
         elseif stmt isa TryOp
-            validate_try_terminators!(errors, sci, stmt, idx)
+            validate_try_terminators!(errors, sci, stmt, idx, entry.type)
         end
     end
 end
 
 function validate_try_terminators!(errors::Vector{String}, sci::StructuredIRCode,
-                                   op::TryOp, idx::Int)
+                                   op::TryOp, idx::Int, @nospecialize(result_type))
     for (name, b) in (("body", op.body), ("handler", op.handler))
         b === nothing && continue
         b.terminator === nothing &&
@@ -134,6 +138,72 @@ function validate_try_terminators!(errors::Vector{String}, sci::StructuredIRCode
     end
     if op.handler !== nothing && length(op.upsilons) != length(op.handler.args)
         push!(errors, "TryOp at %$idx: $(length(op.upsilons)) upsilon lists for $(length(op.handler.args)) handler arguments")
+    end
+
+    # Every exit to the continuation carries the op's results: the yields that end
+    # the body and the handler, and the LeaveOps that exit this body.
+    expected = result_type === Nothing ? () : ifop_expected_yield_types(result_type)
+    if expected !== nothing
+        exits = Pair{String, Block}[]
+        op.body.terminator isa YieldOp && push!(exits, "body yield" => op.body)
+        op.handler !== nothing && op.handler.terminator isa YieldOp &&
+            push!(exits, "handler yield" => op.handler)
+        collect_try_leaves!(exits, op.body)
+        for (what, b) in exits
+            vals = (b.terminator::Union{YieldOp, LeaveOp}).values
+            if length(vals) != length(expected)
+                push!(errors, "TryOp at %$idx: $what carries $(length(vals)) values for result type $result_type")
+                continue
+            end
+            for (i, v) in enumerate(vals)
+                check_yield_type!(errors, b, v, expected[i], idx, i, what; op="TryOp")
+            end
+        end
+    end
+
+    # A value return would leave the body without popping its handler (or scope):
+    # exits from a try go through its continuation.
+    has_value_return(op.body) &&
+        push!(errors, "TryOp at %$idx: a value return inside the body (exits must leave through the continuation)")
+end
+
+# The blocks ending in a LeaveOp that exits `block`'s try body: through IfOp arms and
+# inner TryOp handlers, which run inside this body; loops and inner try bodies are
+# boundaries (as in `validate_leave_placement!`).
+function collect_try_leaves!(out::Vector{Pair{String, Block}}, block::Block)
+    block.terminator isa LeaveOp && push!(out, "leave" => block)
+    for (_, entry) in block.body
+        stmt = entry.stmt
+        if stmt isa IfOp
+            foreach(b -> collect_try_leaves!(out, b), blocks(stmt))
+        elseif stmt isa TryOp && stmt.handler !== nothing
+            collect_try_leaves!(out, stmt.handler)
+        end
+    end
+    return out
+end
+
+function has_value_return(block::Block)
+    t = block.terminator
+    t isa ReturnNode && isdefined(t, :val) && return true
+    for (_, entry) in block.body
+        entry.stmt isa ControlFlowOp || continue
+        any(has_value_return, blocks(entry.stmt)) && return true
+    end
+    return false
+end
+
+# Each listed upsilon of a TryOp handler argument names an UpsilonNode statement.
+function validate_try_upsilons!(errors::Vector{String}, sci::StructuredIRCode)
+    upsilons = Set{Int}()
+    tries = Pair{Int, TryOp}[]
+    for b in eachblock(sci.entry), (idx, entry) in b.body
+        entry.stmt isa Core.UpsilonNode && push!(upsilons, idx)
+        entry.stmt isa TryOp && push!(tries, idx => entry.stmt)
+    end
+    for (idx, op) in tries, (k, us) in enumerate(op.upsilons), u in us
+        u in upsilons ||
+            push!(errors, "TryOp at %$idx: upsilon %$u of handler argument $k is not an UpsilonNode")
     end
 end
 
@@ -236,12 +306,13 @@ end
 # parent chain and resolves SSAs defined in the surrounding scope.
 function check_yield_type!(errors::Vector{String}, block::Block,
                             @nospecialize(value), @nospecialize(expected),
-                            idx::Int, pos::Int, branch::String)
+                            idx::Int, pos::Int, branch::String; op::String="IfOp")
     value isa Undef && return
     ty = value_type(block, value)
     ty === nothing && return
     if !(ty <: expected)
-        push!(errors, "IfOp at %$idx: $branch yield at position $pos has type $ty, not <: declared $expected")
+        what = op == "IfOp" ? "$branch yield" : branch
+        push!(errors, "$op at %$idx: $what at position $pos has type $ty, not <: declared $expected")
     end
 end
 
