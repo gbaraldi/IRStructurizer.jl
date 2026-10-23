@@ -312,10 +312,19 @@ and it rejects unbalanced input. For a try entered at block B with stack σ:
 
 - **R (body)**: blocks whose entry stack contains the try. Every edge out of R
   starts at a leave block and lands on a block with stack σ.
-- **C (handler)**: blocks dominated by the catch block whose stack extends σ, minus
-  leave blocks that pop a handler in σ. Those belong to the enclosing body: a
-  handler that exits an outer try first reaches its leave block, which is then a
+- **C (handler)**: blocks dominated by the catch block whose stack extends σ and
+  that run before the catch's `pop_exception`, minus leave blocks that pop a
+  handler in σ. A block runs before the pop when its exception state (the second
+  component of `compute_trycatch`, `exception_states`) is this catch's, or that of
+  a catch nested in it. The leave blocks belong to the enclosing body: a handler
+  that exits an outer try first reaches its leave block, which is then a
   continuation of *this* try.
+
+  Dominance alone is not enough when the body cannot complete normally (it always
+  throws, or loops forever as in `Base.wait_forever`). The catch block then
+  dominates all the code after the handler, including each continuation that
+  normalization builds. The handler would absorb every mux built for its exits,
+  and normalization would never converge.
 
 Because stacks are balanced, the regions of different trys nest properly. An inner
 try's R and C lie inside the outer R (or C), and a natural loop with header in R
@@ -383,6 +392,9 @@ which a funnel-style "try latch" could not: dead ends never reach the latch.
   exits it dispatches on a selector after a shared copy. Both are ordinary CFG to
   the structurizer, giving a handler that ends in `rethrow` (`ReturnNode()`) and a
   multi-exit continuation.
+- **A body that cannot complete normally.** Every exit of the try is a handler
+  exit, and the code after the handler is a continuation like any other (§4.1),
+  even though the catch block dominates it.
 - **Catch block reached by ordinary control flow** never comes out of Julia
   lowering. It is rejected.
 - **Variables undefined on the catch path.** A variable never assigned before a
@@ -465,17 +477,18 @@ may instead end in the first exception the direct call throws.
 - ScopedValues `@with`, including the scope-only `EnterNode(0, scope)`
 
 - ScopedValue reads inlined into the function (not hidden behind `@noinline`)
+- a body that cannot complete normally, inside a loop and with two handler exits
 
 The battery outside the test suite also covers a try returning a `Union`
 (`p3`).
 
 Beyond the hand-written shapes, every Base/stdlib method with a concrete
-signature was swept. 77 of them have an `EnterNode` after optimization:
-
-- In both modes (154 lifts), all of them lift, unstructurize and pass
-  `Compiler.verify_ir`, as long as the yield-type check described below is
-  excluded. All other validations stay on.
-- With full validation, 144/154 pass. All 10 failures are that pre-existing check.
+signature was swept: 93 have an `EnterNode` after optimization on Julia 1.12, and
+103 on 1.13. In both modes (186 and 206 lifts), all of them lift with full
+validation, unstructurize and pass `Compiler.verify_ir`. The first version of this
+sweep (77 methods, 1.12) had 10 lifts fail the yield-type check, which the
+narrowing `PiNode` fixes (§6, fixes). On 1.13, `Base.wait_forever` did not
+converge until the handler boundary at `pop_exception` (§4.1).
 
 **Not handled or known limitations**
 

@@ -390,6 +390,42 @@ eh_scope_only(x) = @with EH_SV => x begin; x + 1 end   # nothrow body: EnterNode
 # feeding it (an `Any` yield into an `Int` slot unless narrowed).
 eh_scoped_inline(x) = @with EH_SV => x begin; EH_SV[] + eh_g(x) end
 eh_scoped_inline_try(x) = try @with EH_SV => x begin; eh_g(EH_SV[]) end catch; EH_SV[] end
+# A body that cannot complete normally: the catch dominates everything after it.
+function eh_throwing_body_in_loop(n)
+    for i in 1:n
+        try
+            eh_throw(ErrorException("x"))
+        catch
+        end
+    end
+    n
+end
+function eh_throwing_body_two_exits(x)
+    x < -5 && @goto big
+    if x > 0
+        try
+            eh_g(x + 20)
+        catch
+        end
+        x > 5 && @goto big
+    end
+    return 0
+    @label big
+    return 1
+end
+# `Base.wait_forever`'s shape: an endless loop around a try whose body is an endless
+# loop. Not run, since it never returns.
+function eh_endless(x)
+    while true
+        try
+            while true
+                eh_log(eh_g(x))
+            end
+        catch e
+            eh_log(e)
+        end
+    end
+end
 # Nested exceptions of one type: only the message tells them apart.
 function eh_same_type(x)
     try
@@ -418,6 +454,7 @@ const EH_CASES = [
     (eh_sequential, (1, 3, 20)), (eh_goto_out, (1, 7, 20)), (eh_lazy, (0, 5, 15)),
     (eh_scoped, (3, 20)), (eh_scope_only, (3, 20)),
     (eh_scoped_inline, (3, 20)), (eh_scoped_inline_try, (3, 20)),
+    (eh_throwing_body_in_loop, (0, 3)), (eh_throwing_body_two_exits, (-9, -1, 3, 9)),
     (eh_same_type, (1, 7, 12)),
 ]
 
@@ -562,6 +599,22 @@ end
     @test length(eh_ops(first(only(code_structured(eh_scoped, Tuple{Int}; exceptions=:trap))), TryOp)) == 1
     @test_throws ArgumentError StructuredIRCode(first(only(code_ircode(eh_basic, (Int,))));
                                                  exceptions=:bogus)
+end
+
+@testset "a body that cannot complete normally" begin
+    # The catch dominates the code after the try (here, the loop's back edge). The
+    # handler region ends at `pop_exception`, so the try has a continuation and
+    # normalization converges (it used to grow the handler by one mux per step).
+    sci, _ = only(code_structured(eh_throwing_body_in_loop, Tuple{Int}))
+    op = only(eh_ops(sci, TryOp))
+    @test op.body.terminator == ReturnNode()
+    @test op.handler.terminator isa YieldOp
+    @test only(eh_ops(sci, ForOp)) isa ForOp
+    # `eh_endless` never returns, so only the lift and the lowering are checked.
+    for exceptions in (:structured, :trap)
+        sci, _ = only(code_structured(eh_endless, Tuple{Int}; exceptions))
+        @test (CC.verify_ir(CC.IRCode(sci)); true)
+    end
 end
 
 @testset "unsupported shapes are rejected" begin

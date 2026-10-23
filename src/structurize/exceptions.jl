@@ -123,10 +123,20 @@ end
     try_info(m, stacks=handler_stacks(m), domtree=...) -> Dict{Int, TryRegion}
 
 The `TryRegion` of every reachable `MEnter`, keyed by the `MEnter` id.
+
+A handler region ends where its exception is popped. When the protected body
+cannot complete normally (it always throws, or loops forever), the catch block
+dominates all the code after the handler, so dominance alone would pull that code
+in, and with it every continuation `normalize_one_try!` builds. So a block is in the
+handler only if it is entered with the exception state of this catch, or of a catch
+nested in it (`exception_states`), not the state `pop_exception` restores.
 """
 function try_info(m::MCFG, stacks=handler_stacks(m),
                   domtree::DomTree=construct_domtree(build_cfg(m)))
     regions = Dict{Int, TryRegion}()
+    enter_block = Dict{Int, Int}(b.term.id => bid for (bid, b) in enumerate(m.blocks)
+                                 if b.term isa MEnter && stacks[bid] !== nothing)
+    estate, at_enter = exception_states(m, enter_block)
     for (bid, b) in enumerate(m.blocks)
         t = b.term
         t isa MEnter || continue
@@ -145,6 +155,7 @@ function try_info(m::MCFG, stacks=handler_stacks(m),
                 s === nothing && continue
                 (length(s) >= d && view(s, 1:d) == σ) || continue
                 dominates(domtree, c, x) || continue
+                in_catch(estate[x], t.id, at_enter) || continue
                 is_outer_leave(m.blocks[x], σ) && continue
                 push!(handler, x)
             end
@@ -152,6 +163,17 @@ function try_info(m::MCFG, stacks=handler_stacks(m),
         regions[t.id] = TryRegion(t.id, bid, body, handler, length(σ))
     end
     return regions
+end
+
+"""Whether exception state `s` lies inside the catch of the enter `e`: it is `e`'s own
+state, or that of a catch nested in it (whose enter ran in state `e`)."""
+function in_catch(s::Int, e::Int, at_enter::Dict{Int, Int})
+    for _ in 0:length(at_enter)       # the states form a tree; bound the walk anyway
+        s == e && return true
+        s <= 0 && return false
+        s = get(at_enter, s, 0)
+    end
+    return false
 end
 
 """The edges that leave a try's body and handler (R ∪ C). Each lands on a block that
