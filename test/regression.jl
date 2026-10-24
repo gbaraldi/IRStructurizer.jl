@@ -1120,4 +1120,58 @@ end
     @test execute(sci, 3) == narrow_iter(3)
 end
 
+@testset "a branch whose two edges reach the same continuation entry" begin
+    # SparseColumnPivotedQR's `_usolve!`: continues out of nested branches. A block
+    # ending in a conditional branch with both edges to one continuation entry lists
+    # that entry twice among its successors; its edges are routed through the
+    # continuation's mux once each.
+    function usolve!(z::Vector{Float64}, Rp::Vector{Int}, Ri::Vector{Int}, Rx::Vector{Float64},
+                     n::Int, tol::Float64)
+        for k in n:-1:1
+            rc1 = Rp[k]; rc2 = Rp[k + 1] - 1
+            if rc2 >= rc1 && Ri[rc2] == k
+                d = Rx[rc2]
+                if abs(d) <= tol || d == 0
+                    z[k] = 0.0
+                    continue
+                end
+                z[k] /= d
+            else
+                diag_p = 0
+                for p in rc1:rc2
+                    if Ri[p] == k
+                        diag_p = p
+                        break
+                    end
+                end
+                if diag_p == 0
+                    z[k] = 0.0
+                    continue
+                end
+                d = Rx[diag_p]
+                if abs(d) <= tol || d == 0
+                    z[k] = 0.0
+                    continue
+                end
+                z[k] /= d
+                zk = z[k]
+                for p in rc1:rc2
+                    p == diag_p && continue
+                    z[Ri[p]] -= Rx[p] * zk
+                end
+            end
+        end
+        return z
+    end
+    sci, _ = code_structured(usolve!, Tuple{Vector{Float64}, Vector{Int}, Vector{Int},
+                                            Vector{Float64}, Int, Float64}) |> only
+    # columns: the diagonal last, first, absent, or zero
+    Rp = [1, 2, 4, 6, 7, 9]
+    Ri = [1, 1, 2, 3, 1, 3, 4, 2]
+    for Rx in ([2.0, 0.5, 3.0, 4.0, 1.0, 0.0, 5.0, 1.5], [1.0, 2.0, 0.0, 1.0, 1.0, 2.0, 0.0, 3.0]),
+        tol in (0.0, 1.5)
+        @test execute(sci, ones(5), Rp, Ri, Rx, 5, tol) == usolve!(ones(5), Rp, Ri, Rx, 5, tol)
+    end
+end
+
 end  # regression suite
