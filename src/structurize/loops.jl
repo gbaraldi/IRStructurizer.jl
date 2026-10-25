@@ -28,7 +28,8 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
                               region_blocks::Set{Int},
                               loop_ctx::Union{Nothing, LoopCtx}=nothing;
-                              depth::Union{Nothing, Vector{Int}}=nothing)
+                              depth::Union{Nothing, Vector{Int}}=nothing,
+                              find_merge::Bool=true)
     nblocks = length(cfg.blocks)
 
     then_blocks = Set{Int}()
@@ -51,6 +52,10 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
     # Remove any overlap with loop bodies that will be handled separately
     # (a block should only be in one region)
     setdiff!(then_blocks, else_blocks)
+
+    # The normalizer needs the richer continuation entries below and computes
+    # them itself. Do not scan all arm edges twice for that caller.
+    find_merge || return then_blocks, else_blocks, nothing
 
     # Continuation by exclusion (MLIR `transformToStructuredCFBranches`): the
     # merge is the single distinct target of the edges leaving `current ∪ then ∪

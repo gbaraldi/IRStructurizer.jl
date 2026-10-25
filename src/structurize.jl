@@ -28,7 +28,7 @@ end
 function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
-    loops = natural_loops_m(m)
+    loops = natural_loops_m(m, cfg, domtree)
     if has_enter(m)
         stacks = handler_stacks(m)
         try_regions = try_info(m, stacks, domtree)

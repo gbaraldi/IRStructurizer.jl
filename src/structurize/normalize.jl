@@ -34,9 +34,8 @@ end
 single entry with a mux (MLIR's `createSingleEntryBlock` over entry and back
 edges). Returns `true` if it muxed one, `false` if the CFG has no irreducible
 SCC."""
-function normalize_one_irreducible!(m::MCFG)
-    cfg = build_cfg(m)
-    domtree = construct_domtree(cfg)
+function normalize_one_irreducible!(m::MCFG, cfg::CFG=build_cfg(m),
+                                    domtree::DomTree=construct_domtree(cfg))
     reach = CFGReachability(cfg, domtree)
     nb = length(m.blocks)
 
@@ -85,9 +84,8 @@ A loop that contains an `MEnter` also contains that try's whole protected region
 and handler (`extend_loops_over_trys!`), so a throwing dead end in the region, or
 a handler that leaves the loop, stays inside the `TryOp` instead of becoming a
 loop exit that the latch would hoist out of the try."""
-function natural_loops_m(m::MCFG)
-    cfg = build_cfg(m)
-    domtree = construct_domtree(cfg)
+function natural_loops_m(m::MCFG, cfg::CFG=build_cfg(m),
+                         domtree::DomTree=construct_domtree(cfg))
     loops = Dict{Int, Set{Int}}()
     nb = length(m.blocks)
     for src in 1:nb
@@ -272,9 +270,11 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int},
         append!(pred_refs, edge_refs(m, src, latch))
     end
 
+    larg_of = Dict{Int, Int}()
     for v in escaping
         T = get(def_type, v, Any)
         larg = alloc_id!(m)
+        larg_of[v] = larg
         m.types[larg] = T
         m.codelocs[larg] = get(m.codelocs, v, _NOLOC)
         push!(m.blocks[latch].args, larg)
@@ -286,11 +286,13 @@ function reduce_loop!(m::MCFG, header::Int, latch::Int, loop_blocks::Set{Int},
                    !isdisjoint(reach[t], use_blocks[v])
             push!(e.args, feed ? SSAValue(v) : Undef(T))
         end
-        fv(@nospecialize(w)) = (w isa SSAValue && w.id == v) ? SSAValue(larg) : w
-        for bid in 1:length(m.blocks)
-            bid in loop_blocks && continue
-            _rewrite_mblock!(m.blocks[bid], fv)
-        end
+    end
+    # Every outside use, in one pass (the latch args are fresh ids, so no rewrite feeds another,
+    # and the edges into the latch leave loop blocks, which are not rewritten).
+    fv(@nospecialize(w)) = w isa SSAValue && haskey(larg_of, w.id) ? SSAValue(larg_of[w.id]) : w
+    for bid in 1:length(m.blocks)
+        bid in loop_blocks && continue
+        _rewrite_mblock!(m.blocks[bid], fv)
     end
 end
 
@@ -298,8 +300,7 @@ end
 a single-exiting latch in reduce form. The >=2-exit-edge case is a multi-exit
 loop; the >=2-back-edge case is a post-entry-mux irreducible loop, whose back
 edges the one latch unifies. Returns `true` if it transformed one."""
-function normalize_one_loop_latch!(m::MCFG)
-    loops = natural_loops_m(m)
+function normalize_one_loop_latch!(m::MCFG, loops=natural_loops_m(m))
     for h in sort!(collect(keys(loops)))
         body = loops[h]
         back_refs = EdgeRef[]; exit_refs = EdgeRef[]
@@ -349,21 +350,29 @@ continuation), making it single-entry. Returns `true` if it muxed one. After thi
 the lift's ordinary IfOp path handles short-circuits, N-way merges, and nested
 gated bodies uniformly, with `find_branch_regions` always finding a singleton
 merge."""
-function normalize_one_continuation!(m::MCFG)
-    cfg = build_cfg(m)
-    domtree = construct_domtree(cfg)
-    loops = natural_loops_m(m)
+function normalize_one_continuation!(m::MCFG, cfg::CFG=build_cfg(m),
+                                     domtree::DomTree=construct_domtree(cfg),
+                                     loops=natural_loops_m(m, cfg, domtree))
+    found = find_continuation(m, cfg, domtree, loops)
+    found === nothing && return false
+    single_entry_mux!(m, found[2])
+    return true
+end
+
+"""The first conditional (by block index, from `start`) with a multi-entry continuation,
+and the edges into that continuation: `(E, refs)`, or `nothing`."""
+function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::Int=1)
     all_blocks = Set(1:length(m.blocks))
     # Edges that leave a try body enclosing the branch become `LeaveOp`s in the
     # lift, not continuation entries; `depth` lets `branch_continuation` skip them.
     depth = has_enter(m) ? handler_depths(m) : nothing
-    for E in 1:length(m.blocks)
+    for E in start:length(m.blocks)
         t = m.blocks[E].term
         t isa MCondBr || continue
         true_dest, false_dest = t.t.target, t.f.target
         lctx = enclosing_loop_ctx(loops, E)
         then_blocks, else_blocks, _ =
-            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx; depth)
+            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx; depth, find_merge=false)
         entries, notcont = branch_continuation(cfg, domtree, E, true_dest, false_dest,
                                                then_blocks, else_blocks, all_blocks, lctx;
                                                depth)
@@ -379,10 +388,9 @@ function normalize_one_continuation!(m::MCFG)
         for b in sort!(collect(notcont)), succ in unique(cfg.blocks[b].succs)
             succ in entryset && append!(refs, edge_refs(m, b, succ))
         end
-        single_entry_mux!(m, refs)
-        return true
+        return E, refs
     end
-    return false
+    return nothing
 end
 
 #=============================================================================
@@ -409,9 +417,7 @@ an entry value as a loop result.
 `absorb=false`, entry edges only: the pre-header forwards into the header's
 existing args, and the single-exiting latch still owns back/exit unification.
 Runs after irreducible + latch so it sees the final (mux) header."""
-function normalize_one_preheader!(m::MCFG)
-    loops = natural_loops_m(m)
-    cfg = build_cfg(m)
+function normalize_one_preheader!(m::MCFG, loops=natural_loops_m(m), cfg::CFG=build_cfg(m))
     for h in sort!(collect(keys(loops)))
         body = loops[h]
         entry_refs = EdgeRef[]
@@ -426,6 +432,13 @@ function normalize_one_preheader!(m::MCFG)
     return false
 end
 
+# How `normalize_cf!` drives the passes, as a switch for comparison: `:fast` computes the CFG,
+# dominator tree and loops once per round (every mutating pass ends the round) and resumes the
+# continuation scan at the branch it muxed last (scanning from the start again before concluding
+# that none is left, and after any other pass's mutation); `:original` lets every pass compute
+# its own analyses and scans from the start every round.
+const NORMALIZE_MODE = Ref(:fast)
+
 """Mutate `m` until no multi-entry situation remains. Each step collapses one
 multi-entry header (irreducible), one multi-exit loop (the single-exiting latch +
 reduce form), one multi-predecessor branch continuation, or one multi-entry loop
@@ -436,11 +449,42 @@ function normalize_cf!(m::MCFG)
     changed = false
     guard = 0
     limit = length(m.blocks) + 16
+    fast = NORMALIZE_MODE[] === :fast
+    cursor = resumed = 1
     # Try regions go first: once each `TryOp` has a single continuation, the other
     # passes only ever redirect edges between blocks that hold the same handlers.
-    while normalize_one_try!(m) || normalize_one_irreducible!(m) ||
-          normalize_one_loop_latch!(m) || normalize_one_continuation!(m) ||
-          normalize_one_preheader!(m)
+    while true
+        if !fast
+            mutated = normalize_one_try!(m) || normalize_one_irreducible!(m) ||
+                      normalize_one_loop_latch!(m) || normalize_one_continuation!(m) ||
+                      normalize_one_preheader!(m)
+        else
+            mutated = normalize_one_try!(m)
+            if !mutated
+                cfg = build_cfg(m)
+                domtree = construct_domtree(cfg)
+                mutated = normalize_one_irreducible!(m, cfg, domtree)
+            end
+            if !mutated
+                loops = natural_loops_m(m, cfg, domtree)
+                mutated = normalize_one_loop_latch!(m, loops)
+            end
+            if !mutated
+                found = find_continuation(m, cfg, domtree, loops; start=cursor)
+                if found === nothing && cursor > 1
+                    found = find_continuation(m, cfg, domtree, loops)
+                end
+                if found !== nothing
+                    single_entry_mux!(m, found[2])
+                    resumed = found[1]
+                    mutated = true
+                end
+            end
+            mutated = mutated || normalize_one_preheader!(m, loops, cfg)
+        end
+        mutated || break
+        cursor = resumed
+        resumed = 1
         changed = true
         guard += 1
         guard > 8 * limit && error("normalize_cf! failed to converge (likely a mux bug)")

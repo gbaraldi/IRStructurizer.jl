@@ -69,3 +69,5 @@ end
     include("debuginfo.jl")
     include("regression.jl")
 end
+
+include("normalization_reuse.jl")
