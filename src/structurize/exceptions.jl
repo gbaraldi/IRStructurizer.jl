@@ -245,6 +245,60 @@ function fold_single_edge_args!(m::MCFG)
     end
 end
 
+"""Fold the block arguments that every incoming edge leaves undefined and that only feed
+other block arguments. Julia keeps a phi with no incoming values (defined on no path
+into its block, e.g. a union-split result that only the other member's path computes)
+when a later phi still names it on an edge whose value is never read. Such an argument
+has no value to carry, so it leaves its block and edges, and the edge operands that
+name it become `Undef` of its type. Repeats until none is left: an operand rewritten
+to `Undef` can leave a later argument undefined on every edge too. An argument a
+statement, branch, return or scope reads stays, as do a catch block's arguments (fed
+by its handler, not by edges)."""
+function fold_undef_args!(m::MCFG)
+    catch_dests = Set{Int}(b.term.catch_dest for b in m.blocks if b.term isa MEnter)
+    while true
+        stmt_uses = Set{Int}()
+        note(@nospecialize(v)) = (v isa SSAValue && push!(stmt_uses, v.id); v)
+        for b in m.blocks
+            for st in b.body
+                st.stmt isa Core.PhiCNode || remap_ssa(st.stmt, note)
+            end
+            t = b.term
+            t isa MCondBr && note(t.cond)
+            t isa MReturn && t.has_val && note(t.val)
+            t isa MEnter && t.scope !== nothing && note(t.scope)
+        end
+        incoming = [MEdge[] for _ in m.blocks]
+        for b in m.blocks
+            t = b.term
+            edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) :
+                    t isa MEnter ? (t.body,) : ()
+            for e in edges
+                push!(incoming[e.target], e)
+            end
+        end
+        subst = Dict{Int, Any}()
+        for (bid, b) in enumerate(m.blocks)
+            (isempty(b.args) || isempty(incoming[bid]) || bid in catch_dests) && continue
+            dead = [k for k in eachindex(b.args)
+                    if !(b.args[k] in stmt_uses) && all(e -> e.args[k] isa Undef, incoming[bid])]
+            isempty(dead) && continue
+            for k in dead
+                subst[b.args[k]] = Undef(get(m.types, b.args[k], Any))
+            end
+            deleteat!(b.args, dead)
+            for e in incoming[bid]
+                deleteat!(e.args, dead)
+            end
+        end
+        isempty(subst) && return
+        resolve(@nospecialize(v)) = (v isa SSAValue && haskey(subst, v.id)) ? subst[v.id] : v
+        for b in m.blocks
+            _rewrite_mblock!(b, resolve)
+        end
+    end
+end
+
 """Give every `:leave` a block of its own that pops one handler. Julia ends a block
 at each `:leave`, which may pop several handlers at once (a `return` out of nested
 trys). The leave moves to a chain of new blocks that pop the handlers innermost

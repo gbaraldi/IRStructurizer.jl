@@ -37,6 +37,22 @@ function renamed(n::Int)
 end
 end
 
+# A union-split call whose two members define different values: the `D` method builds
+# its result from fields the `Float64` method never computes (a NaN-safe `sin` on a
+# number or on a value-and-derivative pair).
+module UndefPhi
+struct D
+    v::Float64
+    p::Float64
+end
+@inline nsin(x::Float64) = isinf(x) ? NaN : sin(x)
+@inline ncos(x::Float64) = isinf(x) ? NaN : cos(x)
+@inline nsin(x::D) = D(nsin(x.v), ncos(x.v) * x.p)
+@inline val(x::Float64) = x
+@inline val(x::D) = x.v + x.p
+f(x::Union{Float64,D}) = val(nsin(x))
+end
+
 # A constant the tests rebind after inferring code that calls it.
 module ReboundIntrinsic
 const cmp = Core.Intrinsics.slt_int
@@ -1171,6 +1187,40 @@ end
     for Rx in ([2.0, 0.5, 3.0, 4.0, 1.0, 0.0, 5.0, 1.5], [1.0, 2.0, 0.0, 1.0, 1.0, 2.0, 0.0, 3.0]),
         tol in (0.0, 1.5)
         @test execute(sci, ones(5), Rp, Ri, Rx, 5, tol) == usolve!(ones(5), Rp, Ri, Rx, 5, tol)
+    end
+end
+
+@testset "a phi with no incoming values feeding a later phi" begin
+    # Optimized IR keeps a phi with no incoming values (defined on no path into its
+    # block) when a later phi still names it on an edge whose value is never read: the
+    # merge's argument for it is `Undef` on every edge. Its operands become `Undef`.
+    #  1: goto 5 if not c      2: goto 4 if not d      3: goto 4
+    #  4: %4 = φ()                                      goto 6
+    #  5: %6 = x * x                                    goto 6
+    #  6: %8 = φ(4 => %4, 5 => %6); %9 = φ(4 => false, 5 => true); return ifelse(%9, %8, 1.0)
+    mul = GlobalRef(Core.Intrinsics, :mul_float)
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 5), Any)],                      succs=[5, 2]),
+        (stmts=[(GotoIfNot(Argument(3), 4), Any)],                      succs=[4, 3]),
+        (stmts=[(GotoNode(4), Any)],                                    succs=[4]),
+        (stmts=[(PhiNode(Int32[], Any[]), Float64), (GotoNode(6), Any)], succs=[6]),
+        (stmts=[(Expr(:call, mul, Argument(4), Argument(4)), Float64),
+                (GotoNode(6), Any)],                                    succs=[6]),
+        (stmts=[(PhiNode(Int32[4, 5], Any[SSAValue(4), SSAValue(6)]), Float64),
+                (PhiNode(Int32[4, 5], Any[false, true]), Bool),
+                (Expr(:call, GlobalRef(Core, :ifelse), SSAValue(9), SSAValue(8), 1.0), Float64),
+                (ReturnNode(SSAValue(10)), Any)],                       succs=Int[]),
+    ], Any[Any, Bool, Bool, Float64])
+    sci = StructuredIRCode(ir)                                    # validates
+    for c in (true, false), d in (true, false)
+        @test execute(sci, c, d, 0.75) === (c ? 1.0 : 0.75 * 0.75)
+    end
+    # The same shape from source (on Julia 1.13): after union splitting, the fields of
+    # the `D` result are undefined on the `Float64` path.
+    ir, _ = only(code_ircode(UndefPhi.f, Tuple{Union{Float64,UndefPhi.D}}))
+    sci = StructuredIRCode(ir)                                    # validates
+    for x in (0.3, Inf, UndefPhi.D(0.7, 2.0), UndefPhi.D(Inf, 1.0))
+        @test isequal(execute(sci, x), UndefPhi.f(x))
     end
 end
 

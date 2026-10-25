@@ -116,6 +116,7 @@ function ingest(ir::IRCode; exceptions::Symbol=:structured)
         retarget_pop_exceptions!(m)
         undef_bottom_values!(m)
     end
+    fold_undef_args!(m)
     return m
 end
 
