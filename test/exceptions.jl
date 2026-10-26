@@ -6,7 +6,8 @@
  `ingest(ir; exceptions=:structured)` and `normalize_cf!` build from them.
 =============================================================================#
 
-using IRStructurizer: ingest, handler_stacks, is_leave, MEnter
+using IRStructurizer: ingest, handler_stacks, is_leave, MEnter, try_info, try_exit_refs,
+                      edge_of
 using Base.ScopedValues
 
 const EH_LOG = Any[]
@@ -495,6 +496,32 @@ function eh_try_after_returning_try(x)
     x
 end
 
+const EH_CASES = [
+    (eh_basic, (1, 20)), (eh_exc, (1, 20)), (eh_finally, (1, 20)), (eh_nested, (1, 5, 20)),
+    (eh_upsilon, (1, 15, 20)), (eh_rethrow, (1, 12, 20)), (eh_return_in_try, (1, 7, 20)),
+    (eh_mixed_exit, (-3, 0, 2, 7, 20)), (eh_dead_merge, (0, 2, 5, 20)),
+    (eh_nested_return, (1, 20, -20)), (eh_try_in_loop, (0, 3, 15)),
+    (eh_loop_in_try, (0, 5, 15)), (eh_break_in_try, (3, 20, 100)),
+    (eh_continue_from_catch, (0, 2, 6)), (eh_throw_in_loop_in_try, (0, 5, 9)),
+    (eh_throw_in_try_in_loop, (0, 2, 5)), (eh_return_from_inner_catch, (0, 3, 15, 25)),
+    (eh_finally_break, (0, 3, 15)), (eh_finally_return, (1, 20)),
+    (eh_try_in_catch, (0, 5, 15)), (eh_three_levels, (1, 5, 9, 15)),
+    (eh_sequential, (1, 3, 20)), (eh_goto_out, (1, 7, 20)), (eh_lazy, (0, 5, 15)),
+    (eh_scoped, (3, 20)), (eh_scope_only, (3, 20)),
+    (eh_scoped_inline, (3, 20)), (eh_scoped_inline_try, (3, 20)),
+    (eh_throwing_body_in_loop, (0, 3)), (eh_throwing_body_two_exits, (-9, -1, 3, 9)),
+    (eh_same_type, (1, 7, 12)),
+    (eh_break_from_try_in_catch, (-2, 0, 1, 3, 7)),
+    (eh_return_from_try_in_catch, (-2, 0, 3)),
+    (eh_try_after_returning_try, (0, 3)),
+    (eh_return_from_nested_catch_in_loop, (-2, 0, 3, 7, 12)),
+    (eh_continue_from_try_in_catch, (-2, 3, 7)),
+    (eh_continue_from_try_in_catch_in_try, (-2, 3, 7)),
+    (eh_return_from_finally, (1, 7, 12, 20)),
+    (eh_return_or_break_from_try_in_catch, (-5, 0, 9)),
+    (eh_exits_from_catch_in_nested_loops, (-5, 0, 3, 6, 8)),
+]
+
 @testset "exceptions" begin
 
 @testset "ingest: the exceptions keyword" begin
@@ -541,6 +568,38 @@ end
         (stmts=[(ReturnNode(2), Any)],                           succs=Int[]),
     ], Any[Any, Bool])
     @test_throws UnstructuredControlFlowError ingest(ir; exceptions=:structured)
+end
+
+"""The MCFG `ingest` builds for `f` at `Tuple{Int}`, with try/catch."""
+eh_mcfg(f) = ingest(first(only(code_ircode(f, Tuple{Int}))); exceptions=:structured)
+
+@testset "try regions" begin
+    m = eh_mcfg(eh_nested)
+    regions = try_info(m)
+    @test length(regions) == 2
+    outer, inner = sort!(collect(values(regions)); by=r -> r.depth)
+    @test outer.depth == 0 && inner.depth == 1
+    # The inner try (body and handler) nests in the outer body.
+    @test inner.block in outer.body
+    @test issubset(inner.body, outer.body) && issubset(inner.handler, outer.body)
+    @test isdisjoint(outer.body, outer.handler)
+    # Every edge out of a try's body and handler lands on a block with the stack the
+    # try was entered with. That includes an exit out of a try nested in a catch,
+    # which pops the catch's exception before it leaves the nested try: the leave
+    # block after the pop still belongs to the catch.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        stacks = handler_stacks(m)
+        for r in values(try_info(m)), ref in try_exit_refs(m, r)
+            @test stacks[edge_of(m, ref).target] == stacks[r.block]
+        end
+    end
+    # A body that cannot complete normally: the catch dominates the loop's latch,
+    # but the handler region ends at the catch's `pop_exception`.
+    m = eh_mcfg(eh_throwing_body_in_loop)
+    r = only(values(try_info(m)))
+    loops = IRStructurizer.natural_loops_m(m)
+    @test !any(h -> h in r.handler, keys(loops))
 end
 
 end  # exceptions
