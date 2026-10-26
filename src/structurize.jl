@@ -67,8 +67,9 @@ Rebuild `stmt` with every value operand passed through `f` (a value-mapping
 closure). The SSA-substitution primitive shared by `remap_stmt` (the walk),
 `emit` (multiplex), and `assemble_ircode` (unstructurize); each supplies its own
 `f`. Handles every operand-bearing node: `Expr`, `PiNode`, `PhiNode` (unassigned
-slots left unassigned), `GotoIfNot` (cond), `ReturnNode` (val), and a bare
-`SSAValue`. Clones rather than mutates, so shared IR is safe.
+slots left unassigned), `GotoIfNot` (cond), `ReturnNode` (val), `UpsilonNode` (val),
+`PhiCNode` (the upsilons it names), `EnterNode` (scope), and a bare `SSAValue`.
+Clones rather than mutates, so shared IR is safe.
 """
 function remap_ssa(@nospecialize(stmt), f)
     if stmt isa Expr
@@ -85,6 +86,12 @@ function remap_ssa(@nospecialize(stmt), f)
         return GotoIfNot(f(stmt.cond), stmt.dest)
     elseif stmt isa ReturnNode
         return isdefined(stmt, :val) ? ReturnNode(f(stmt.val)) : stmt
+    elseif stmt isa Core.UpsilonNode
+        return isdefined(stmt, :val) ? Core.UpsilonNode(f(stmt.val)) : stmt
+    elseif stmt isa Core.PhiCNode
+        return Core.PhiCNode(Any[f(v) for v in stmt.values])
+    elseif stmt isa Core.EnterNode
+        return isdefined(stmt, :scope) ? Core.EnterNode(stmt.catch_dest, f(stmt.scope)) : stmt
     elseif stmt isa SSAValue
         return f(stmt)
     else
