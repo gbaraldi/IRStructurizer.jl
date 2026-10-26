@@ -677,4 +677,28 @@ end
     end
 end
 
+@testset "values undefined on the catch path become Undef" begin
+    # A variable never assigned before a throw reaches the catch through a
+    # `Union{}`-typed `PhiCNode`, and phis carry it on. Nothing reads such a value
+    # (Julia guards it with `throw_undef_if_not`), so no edge operand or upsilon
+    # names one after ingest.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        bottom = Set{Int}(a for b in m.blocks for a in b.args if get(m.types, a, Any) === Union{})
+        for b in m.blocks, s in b.body
+            s.stmt isa Core.PhiCNode && s.type === Union{} && push!(bottom, s.id)
+        end
+        isbottom(v) = v isa SSAValue && v.id in bottom
+        for b in m.blocks
+            t = b.term
+            edges = t isa IRStructurizer.MGoto ? (t.edge,) :
+                    t isa IRStructurizer.MCondBr ? (t.t, t.f) : t isa MEnter ? (t.body,) : ()
+            @test !any(e -> any(isbottom, e.args), edges)
+            @test !any(s -> s.stmt isa Core.UpsilonNode && isdefined(s.stmt, :val) &&
+                            isbottom(s.stmt.val), b.body)
+        end
+    end
+    @test any(s -> s isa Core.PhiCNode, first(only(code_ircode(eh_lazy, (Int,)))).stmts.stmt)
+end
+
 end  # exceptions
