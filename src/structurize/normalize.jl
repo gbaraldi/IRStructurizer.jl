@@ -519,8 +519,8 @@ the lift only structurizes single-entry regions. One `ingest`, then one mutate
 fixpoint over the `MCFG`; the lift (`lift_mcfg`) reads the returned `MCFG`
 directly.
 """
-function normalize_cf(ir::IRCode)
-    m = ingest(ir)
+function normalize_cf(ir::IRCode; exceptions::Symbol=:error)
+    m = ingest(ir; exceptions)
     normalize_cf!(m)
     return m
 end
