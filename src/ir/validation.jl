@@ -114,6 +114,7 @@ function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, bl
         elseif stmt isa LoopOp
             validate_loop_terminators!(errors, sci, stmt, idx)
         end
+        stmt isa LoopOps && check_carry_types!(errors, block, stmt, idx, entry.type)
     end
 end
 
@@ -146,20 +147,15 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
         push!(errors, "IfOp at %$idx: else region must have explicit terminator, got nothing")
     end
 
-    # Validate yield arity and types against the IfOp's declared result type.
+    # Validate yield arity and types against the IfOp's declared result type,
+    # `Tuple{phi_types...}` (see `emit_ifop_result!`). Branches may yield values
+    # of disjoint types (`Int` and `String` joining to `Union{Int,String}`); each
+    # must conform to the declared join.
     #
-    # Julia's own IR verifier (Compiler/src/ssair/verify.jl) only requires that
-    # each phi edge value's type be a sublattice element of the phi's declared
-    # type; it never compares edge values to each other. Branches may yield
-    # values whose types are disjoint (e.g. `Int` and `String` joining to
-    # `Union{Int,String}`, or `Int` and `Float64` joining to `Real`); what
-    # matters is that each yield conforms to the declared join.
-    #
-    # The structurizer records that join at the IfOp's SSA entry as
-    # `Tuple{phi_types...}` (see `emit_ifop_result!`), so we mirror Julia's
-    # check here: for each position i, both yields must be <: the i-th element
-    # of the declared tuple. `<:` is a conservative approximation of the lattice
-    # `⊑` Julia uses internally; it rejects no IR that `⊑` would accept.
+    # This is stricter than Julia, whose verifier (Compiler/src/ssair/verify.jl)
+    # leaves a phi operand wider than the phi unchecked: inference may type the
+    # phi by a refinement that only holds on the edge. The structurizer makes
+    # such a refinement explicit with a `PiNode` (see `narrow_edge_value!`).
     if then_term isa YieldOp && else_term isa YieldOp
         then_arity = length(then_term.values)
         else_arity = length(else_term.values)
@@ -169,16 +165,14 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
 
         expected = ifop_expected_yield_types(result_type)
         if expected !== nothing
-            arity = min(then_arity, else_arity)
             # Flag yield arity that does not match the declared result tuple.
             if then_arity == else_arity && then_arity != length(expected)
                 push!(errors, "IfOp at %$idx: yield arity ($then_arity) does not match declared result type $result_type (expected $(length(expected)))")
             end
-            for i in 1:min(arity, length(expected))
-                Ti = expected[i]
-                check_yield_type!(errors, op.then_region, then_term.values[i], Ti, idx, i, "then")
-                check_yield_type!(errors, op.else_region, else_term.values[i], Ti, idx, i, "else")
-            end
+            check_operand_types!(errors, op.then_region, then_term.values, expected,
+                                 "IfOp at %$idx: then yield")
+            check_operand_types!(errors, op.else_region, else_term.values, expected,
+                                 "IfOp at %$idx: else yield")
         end
     end
 
@@ -186,19 +180,50 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
     validate_terminators!(errors, sci, op.else_region)
 end
 
-# Check a single yield value against the IfOp's declared per-position type.
-# `Undef` placeholders (used for uninitialized slots on one branch) are skipped:
-# their recorded type is already the declared slot type, so the <: check is
-# trivially satisfied. `block` is the yielding region, so `value_type` walks the
-# parent chain and resolves SSAs defined in the surrounding scope.
-function check_yield_type!(errors::Vector{String}, block::Block,
-                            @nospecialize(value), @nospecialize(expected),
-                            idx::Int, pos::Int, branch::String)
-    value isa Undef && return
-    ty = value_type(block, value)
-    ty === nothing && return
-    if !(ty <: expected)
-        push!(errors, "IfOp at %$idx: $branch yield at position $pos has type $ty, not <: declared $expected")
+# Check the values `block` passes on (a terminator's operands, or an op's init
+# values) against the types of the arguments or results they bind. `Undef`
+# placeholders are typed by their slot. `value_type` walks `block`'s parent chain,
+# so SSAs defined in an enclosing scope resolve.
+function check_operand_types!(errors::Vector{String}, block::Block, values, expected,
+                              what::String)
+    for (i, (value, T)) in enumerate(zip(values, expected))
+        value isa Undef && continue
+        ty = value_type(block, value)
+        ty === nothing || ty <: T ||
+            push!(errors, "$what at position $i has type $ty, not <: declared $T")
+    end
+end
+
+# Check a loop's carried values against the region arguments and results they
+# bind, from the block containing the loop and from each exit.
+function check_carry_types!(errors::Vector{String}, block::Block, op::LoopOps, idx::Int,
+                            @nospecialize(result_type))
+    arg_types(b::Block) = Any[a.type for a in b.args]
+    carry_types = arg_types(body_block(op))
+    results = something(ifop_expected_yield_types(result_type), Any[])
+    check_operand_types!(errors, block, op.init_values, carry_types,
+                         "$(nameof(typeof(op))) at %$idx: init value")
+    # A ForOp has no exit terminator: its results are its carries when it ends.
+    if op isa ForOp
+        for (i, (T, R)) in enumerate(zip(carry_types, results))
+            T <: R || push!(errors, "ForOp at %$idx: carry at position $i has type $T, not <: declared $R")
+        end
+    end
+    exits = op isa WhileOp ? [reachable_exits(op.before); reachable_exits(op.after)] :
+                             reachable_exits(op.body)
+    for (blk, term) in exits
+        if term isa ConditionOp
+            check_operand_types!(errors, blk, term.args, arg_types((op::WhileOp).after),
+                                 "WhileOp at %$idx: condition argument")
+            check_operand_types!(errors, blk, term.args, results,
+                                 "WhileOp at %$idx: condition argument")
+        elseif term isa BreakOp
+            check_operand_types!(errors, blk, term.values, results,
+                                 "$(nameof(typeof(op))) at %$idx: break value")
+        else
+            check_operand_types!(errors, blk, operands(term), carry_types,
+                                 "$(nameof(typeof(op))) at %$idx: $(nameof(typeof(term))) value")
+        end
     end
 end
 
