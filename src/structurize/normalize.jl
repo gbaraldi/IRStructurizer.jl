@@ -345,11 +345,32 @@ function normalize_one_continuation!(m::MCFG, cfg::CFG=build_cfg(m),
     return true
 end
 
-"""The first conditional (by block index, from `start`) with a multi-entry continuation,
-and the edges into that continuation: `(E, refs)`, or `nothing`."""
+"""Dominator-tree preorder of the reachable blocks, siblings by block id."""
+function dom_preorder(domtree::DomTree)
+    order = Int[]
+    stack = [1]
+    while !isempty(stack)
+        b = pop!(stack)
+        push!(order, b)
+        append!(stack, sort(domtree.nodes[b].children; rev=true))
+    end
+    return order
+end
+
+"""The first conditional in dominator-tree preorder (siblings by block id), from
+and including block `start`, with a multi-entry continuation, and the edges into
+that continuation: `(E, refs)`, or `nothing`.
+
+Visiting dominating branches first matters when a branch's continuation edges all
+leave one arm: muxed there, the mux joins that arm and its dispatch reproduces the
+same entries. A dominating branch that joins those paths with others has to be
+muxed first, e.g. a loop's exit dispatch, which block index order visits last
+because the latch appends it. Finding a branch whose arm would absorb the mux is
+an error."""
 function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::Int=1)
     all_blocks = Set(1:length(m.blocks))
-    for E in start:length(m.blocks)
+    order = dom_preorder(domtree)
+    for E in @view order[findfirst(==(start), order):end]
         t = m.blocks[E].term
         t isa MCondBr || continue
         true_dest, false_dest = t.t.target, t.f.target
@@ -367,6 +388,9 @@ function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::In
         refs = EdgeRef[]
         for b in sort!(collect(notcont)), r in _edge_refs_of(b, m.blocks[b].term)
             edge_of(m, r).target in entryset && push!(refs, r)
+        end
+        if all(r -> r.src in then_blocks, refs) || all(r -> r.src in else_blocks, refs)
+            error("continuation of branch $E would be absorbed by one of its arms")
         end
         return E, refs
     end
@@ -414,8 +438,9 @@ end
 
 """One normalization round: the first pass with something to collapse mutates `m`,
 and the round ends. The passes share one CFG, dominator tree and loop analysis,
-which any mutation invalidates. The continuation scan starts at block `cursor`
-and falls back to a scan from the first block. Returns the next round's cursor
+which any mutation invalidates. The continuation scan resumes at branch `cursor`
+(a mux and its dispatch blocks are dominated by the branch, so the branches before
+it in preorder are unchanged) and falls back to a scan from the entry. Returns the next round's cursor
 (the branch just muxed, or 1 after any other mutation), or `nothing` if `m` is
 normalized."""
 function normalize_round!(m::MCFG, cursor::Int)
@@ -440,9 +465,8 @@ end
 """Mutate `m` until no multi-entry situation remains. Each step collapses one
 multi-entry header (irreducible), one multi-exit loop (the single-exiting latch +
 reduce form), one multi-predecessor branch continuation, or one multi-entry loop
-header (the pre-header). All strictly reduce the remaining count (the mux block is
-single-entry by construction), so this terminates. The lift then only ever
-structurizes single-entry regions."""
+header (the pre-header), with a round limit as a safeguard. The lift then only
+ever structurizes single-entry regions."""
 function normalize_cf!(m::MCFG)
     limit = 8 * (length(m.blocks) + 16)
     rounds = 0
