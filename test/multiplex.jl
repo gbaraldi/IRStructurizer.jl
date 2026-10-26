@@ -73,9 +73,10 @@ end
 # tree and loops, and the continuation scan starts at the first block every round.
 function normalize_unshared!(m)
     guard = 0
+    limit = 8 * (length(m.blocks) + 16)      # as normalize_cf!: from the blocks before muxing
     while IRStructurizer.normalize_one_irreducible!(m) || IRStructurizer.normalize_one_loop_latch!(m) ||
           IRStructurizer.normalize_one_continuation!(m) || IRStructurizer.normalize_one_preheader!(m)
-        (guard += 1) > 8 * (length(m.blocks) + 16) && error("did not converge")
+        (guard += 1) > limit && error("did not converge")
     end
     return m
 end
