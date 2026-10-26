@@ -111,4 +111,33 @@ end
     end
 end
 
+@testset "uses" begin
+    sci = tryop_sci()
+    op = tryop_of(sci)
+    # The upsilon reads `x`; the handler's argument is not one of its uses (the
+    # `upsilons` lists name statements, not values).
+    @test length(uses(sci.entry, Core.Argument(2))) == 2      # the upsilon and the call
+    @test length(uses(op.handler, op.handler.args[1])) == 1
+    @test isempty(uses(sci.entry, SSAValue(1)))
+    replace_uses!(sci.entry, Core.Argument(2), Core.Argument(3))
+    @test (sci.entry.body[1].stmt::Core.UpsilonNode).val == Core.Argument(3)
+    @test op.body.body[3].stmt.args[2] == Core.Argument(3)
+    # A LeaveOp's values are uses, and a scope is a use of the TryOp.
+    sci = tryop_leave_sci()
+    @test length(uses(sci.entry, SSAValue(9))) == 1
+    scoped = TryOp(Block(), nothing, Vector{Int}[], SSAValue(7))
+    blk = Block()
+    push!(blk, 8, scoped, Nothing)
+    @test length(uses(blk, SSAValue(7))) == 1
+    replace_uses!(blk, SSAValue(7), SSAValue(70))
+    @test scoped.scope == SSAValue(70)
+    # Replacing the scope with `nothing` keeps it a scope (an empty one).
+    replace_uses!(blk, SSAValue(70), nothing)
+    @test IRStructurizer.has_scope(scoped) && scoped.scope === nothing
+    # A try without a scope has no scope use.
+    blk = Block()
+    push!(blk, 8, TryOp(Block(), Block()), Nothing)
+    @test isempty(uses(blk, nothing))
+end
+
 end  # TryOp and LeaveOp
