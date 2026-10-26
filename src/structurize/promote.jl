@@ -462,6 +462,8 @@ function try_promote_for_from_loop(loop::LoopOp, idx::Int, parent_block::Block,
     iv_candidate isa BlockArgument || return (loop, Int[], Dict{Int,Int}())
     iv_pos = findfirst(a -> a.id == iv_candidate.id, body.args)
     iv_pos === nothing && return (loop, Int[], Dict{Int,Int}())
+    # An IV undefined on entry has no lower bound.
+    loop.init_values[iv_pos] isa Undef && return (loop, Int[], Dict{Int,Int}())
 
     # Find step: add_int(iv_arg, step) in the continue branch at iv_pos.
     iv_pos <= length(continue_op.values) || return (loop, Int[], Dict{Int,Int}())
@@ -814,6 +816,8 @@ function try_promote_for(op, idx::Int, parent_block::Block, new_body::SSAMap,
     # Find IV's position in args.
     iv_pos = findfirst(a -> a.id == iv_candidate.id, before.args)
     iv_pos === nothing && return (op, Int[])
+    # An IV undefined on entry has no lower bound.
+    op.init_values[iv_pos] isa Undef && return (op, Int[])
 
     # A ForOp does not carry its IV as a result. If the IV is read after the loop,
     # keep it as an ordinary carry (`keep_iv`) so the post-loop read is a normal
