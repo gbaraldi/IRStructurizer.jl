@@ -40,7 +40,7 @@ function tryop_leave_sci()
     else_blk = Block()
     else_blk.terminator = YieldOp()
     push!(body, 8, IfOp(SSAValue(3), then_blk, else_blk), Nothing)
-    push!(body, 10, Expr(:call, GlobalRef(@__MODULE__, :tryop_g), Core.Argument(2)), Int)
+    push!(body, 10, Expr(:call, tryop_g, Core.Argument(2)), Int)
     body.terminator = YieldOp(IRValue[SSAValue(10)])
     handler = Block()
     push!(handler, 4, Expr(:pop_exception, SSAValue(2)), Nothing)
@@ -49,6 +49,127 @@ function tryop_leave_sci()
     push!(entry, 5, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
     entry.terminator = ReturnNode(SSAValue(5))
     return StructuredIRCode(Any[Any, Int], Any[], entry, 20)
+end
+
+@noinline tryop_throw(x::Int) = error("negative: $x")
+
+"""`f(x) = try x < 0 ? tryop_throw(x) : (y = x + 1); tryop_g(x) catch; y end` with
+`y = x` before the try, by hand: an upsilon in the arm after one that cannot
+return, where lowering numbers the statements differently than this IR does."""
+function tryop_upsilon_in_arm_sci()
+    entry = Block()
+    push!(entry, 1, Core.UpsilonNode(Core.Argument(2)), Nothing)
+    body = Block()
+    push!(body, 3, Expr(:call, Core.Intrinsics.slt_int, Core.Argument(2), 0), Bool)
+    then_blk = Block()
+    push!(then_blk, 4, Expr(:call, tryop_throw, Core.Argument(2)), Union{})
+    then_blk.terminator = ReturnNode()
+    else_blk = Block()
+    push!(else_blk, 6, Expr(:call, Core.Intrinsics.add_int, Core.Argument(2), 1), Int)
+    push!(else_blk, 7, Core.UpsilonNode(SSAValue(6)), Nothing)
+    else_blk.terminator = YieldOp()
+    push!(body, 5, IfOp(SSAValue(3), then_blk, else_blk), Nothing)
+    push!(body, 8, Expr(:call, tryop_g, Core.Argument(2)), Int)
+    body.terminator = YieldOp(IRValue[SSAValue(8)])
+    handler = Block()
+    arg = BlockArgument(1, Int)
+    push!(handler.args, arg)
+    push!(handler, 9, Expr(:pop_exception, SSAValue(2)), Nothing)
+    handler.terminator = YieldOp(IRValue[arg])
+    push!(entry, 2, TryOp(body, handler, [[1, 7]], nothing), Tuple{Int})
+    push!(entry, 10, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    entry.terminator = ReturnNode(SSAValue(10))
+    return StructuredIRCode(Any[Any, Int], Any[], entry, 20)
+end
+
+"""`f(a, b) = try a && leave with 11; b ? 22 : 33 catch; 0 end`, by hand: an `IfOp`
+after one whose arm leaves the body."""
+function tryop_if_after_leave_sci()
+    entry = Block()
+    body = Block()
+    leave_blk = Block(); leave_blk.terminator = LeaveOp(IRValue[11])
+    stay_blk = Block(); stay_blk.terminator = YieldOp()
+    push!(body, 3, IfOp(Core.Argument(2), leave_blk, stay_blk), Nothing)
+    then_blk = Block(); then_blk.terminator = YieldOp(IRValue[22])
+    else_blk = Block(); else_blk.terminator = YieldOp(IRValue[33])
+    push!(body, 4, IfOp(Core.Argument(3), then_blk, else_blk), Tuple{Int})
+    push!(body, 5, Expr(:call, Core.getfield, SSAValue(4), 1), Int)
+    body.terminator = YieldOp(IRValue[SSAValue(5)])
+    handler = Block()
+    push!(handler, 6, Expr(:pop_exception, SSAValue(2)), Nothing)
+    handler.terminator = YieldOp(IRValue[0])
+    push!(entry, 2, TryOp(body, handler), Tuple{Int})
+    push!(entry, 7, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    entry.terminator = ReturnNode(SSAValue(7))
+    return StructuredIRCode(Any[Any, Bool, Bool], Any[], entry, 10)
+end
+
+"""Nested trys, by hand:
+
+    f(x) = try
+        y = try tryop_g(x) catch; x > 20 && leave the outer try with -1; 0 end
+        tryop_g(y)
+    catch
+        -2
+    end
+
+The inner handler leaves the outer body with a `LeaveOp`."""
+function tryop_nested_sci()
+    entry = Block()
+    inner_body = Block()
+    push!(inner_body, 4, Expr(:call, tryop_g, Core.Argument(2)), Int)
+    inner_body.terminator = YieldOp(IRValue[SSAValue(4)])
+    inner_handler = Block()
+    push!(inner_handler, 5, Expr(:pop_exception, SSAValue(3)), Nothing)
+    push!(inner_handler, 6, Expr(:call, Core.Intrinsics.slt_int, 20, Core.Argument(2)), Bool)
+    leave_blk = Block(); leave_blk.terminator = LeaveOp(IRValue[-1])
+    stay_blk = Block(); stay_blk.terminator = YieldOp()
+    push!(inner_handler, 7, IfOp(SSAValue(6), leave_blk, stay_blk), Nothing)
+    inner_handler.terminator = YieldOp(IRValue[0])
+    body = Block()
+    push!(body, 3, TryOp(inner_body, inner_handler), Tuple{Int})
+    push!(body, 8, Expr(:call, Core.getfield, SSAValue(3), 1), Int)
+    push!(body, 9, Expr(:call, tryop_g, SSAValue(8)), Int)
+    body.terminator = YieldOp(IRValue[SSAValue(9)])
+    handler = Block()
+    push!(handler, 10, Expr(:pop_exception, SSAValue(2)), Nothing)
+    handler.terminator = YieldOp(IRValue[-2])
+    push!(entry, 2, TryOp(body, handler), Tuple{Int})
+    push!(entry, 11, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    entry.terminator = ReturnNode(SSAValue(11))
+    return StructuredIRCode(Any[Any, Int], Any[], entry, 20)
+end
+
+"""`f(x) = try tryop_g(x) catch; rethrow() end`, by hand."""
+function tryop_rethrow_sci()
+    entry = Block()
+    body = Block()
+    push!(body, 3, Expr(:call, tryop_g, Core.Argument(2)), Int)
+    body.terminator = YieldOp(IRValue[SSAValue(3)])
+    handler = Block()
+    push!(handler, 4, Expr(:call, rethrow), Union{})
+    handler.terminator = ReturnNode()
+    push!(entry, 2, TryOp(body, handler), Tuple{Int})
+    push!(entry, 5, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    entry.terminator = ReturnNode(SSAValue(5))
+    return StructuredIRCode(Any[Any, Int], Any[], entry, 10)
+end
+
+const TRYOP_SV = Base.ScopedValues.ScopedValue(1)
+@noinline tryop_readsv() = TRYOP_SV[]
+
+"""A scope-only try around `tryop_readsv()`, by hand: with the empty scope
+`nothing` as its operand when `scoped`, else with no scope operand at all."""
+function tryop_scope_sci(scoped::Bool)
+    entry = Block()
+    body = Block()
+    push!(body, 3, Expr(:call, tryop_readsv), Int)
+    body.terminator = YieldOp(IRValue[SSAValue(3)])
+    op = scoped ? TryOp(body, nothing, Vector{Int}[], nothing) : TryOp(body, nothing)
+    push!(entry, 2, op, Tuple{Int})
+    push!(entry, 4, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    entry.terminator = ReturnNode(SSAValue(4))
+    return StructuredIRCode(Any[Any], Any[], entry, 10)
 end
 
 tryop_of(sci) = only(e.stmt for (_, e) in sci.entry.body if e.stmt isa TryOp)
@@ -250,6 +371,43 @@ end
     entry.terminator = ReturnNode(nothing)
     @test_throws "SSA values used but not defined: %2" validate_ssa_defs(
         StructuredIRCode(Any[Any, Int], Any[], entry, 10))
+end
+
+@testset "lowering" begin
+    # Lowered to `EnterNode`, `:leave`, `PhiCNode` and `pop_exception`; the result
+    # passes Julia's verifier and catches, including the exception-stack pop.
+    for (sci, cases) in ((tryop_sci(), (1 => 2, 20 => -20)),
+                         (tryop_leave_sci(), (-2 => 6, 1 => 2, 20 => 0)),
+                         (tryop_upsilon_in_arm_sci(), (-3 => -3, 4 => 5, 20 => 21)),
+                         (tryop_nested_sci(), (1 => 3, 10 => -2, 15 => 1, 25 => -1)))
+        ir = CC.IRCode(sci)
+        @test (CC.verify_ir(ir); true)
+        @test any(s -> s isa Core.EnterNode, ir.stmts.stmt)
+        @test any(s -> s isa Core.PhiCNode, ir.stmts.stmt) == !isempty(tryop_of(sci).upsilons)
+        for (x, expected) in cases
+            @test execute(sci, x) == expected
+            @test isempty(current_exceptions())
+        end
+    end
+    # The code after an IfOp whose arm leaves the body falls through to the right
+    # block.
+    sci = tryop_if_after_leave_sci()
+    @test (CC.verify_ir(CC.IRCode(sci)); true)
+    for (a, b, expected) in ((false, false, 33), (false, true, 22), (true, false, 11))
+        @test execute(sci, a, b) == expected
+    end
+    # A handler that rethrows.
+    sci = tryop_rethrow_sci()
+    @test execute(sci, 1) == 2
+    @test_throws "big: 20" execute(sci, 20)
+    @test isempty(current_exceptions())
+    # An empty scope operand is kept: the body does not see the caller's bindings.
+    for (scoped, expected) in ((true, 1), (false, 5))
+        sci = tryop_scope_sci(scoped)
+        enter = only(s for s in CC.IRCode(sci).stmts.stmt if s isa Core.EnterNode)
+        @test isdefined(enter, :scope) == scoped
+        @test Base.ScopedValues.with(() -> execute(sci), TRYOP_SV => 5) == expected
+    end
 end
 
 end  # TryOp and LeaveOp
