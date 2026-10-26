@@ -349,7 +349,8 @@ function normalize_one_continuation!(m::MCFG)
         # reached from inside the continuation), so absorb=false.
         entryset = Set(entries)
         refs = EdgeRef[]
-        for b in sort!(collect(notcont)), succ in cfg.blocks[b].succs
+        # (a block whose two edges reach the same entry lists it twice, once per edge)
+        for b in sort!(collect(notcont)), succ in unique(cfg.blocks[b].succs)
             succ in entryset && append!(refs, edge_refs(m, b, succ))
         end
         single_entry_mux!(m, refs)
@@ -388,7 +389,7 @@ function normalize_one_preheader!(m::MCFG)
     for h in sort!(collect(keys(loops)))
         body = loops[h]
         entry_refs = EdgeRef[]
-        for p in sort!(collect(cfg.blocks[h].preds))
+        for p in sort!(unique(cfg.blocks[h].preds))
             p ∈ body && continue                      # back edge stays on the header
             append!(entry_refs, edge_refs(m, p, h))
         end
