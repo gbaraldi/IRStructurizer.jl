@@ -164,8 +164,12 @@ it), never dropped to a bare break."""
 function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
                             loop_ctx::LoopCtx)
     if dest == loop_ctx.header
+        # A carried value can be a block argument the walk bound after `emit_loop!`
+        # collected it (`bind_single_pred_args!`: the back edge leaves a block with
+        # a single predecessor, e.g. the exit of an inner loop); rename it now.
         block.terminator === nothing &&
-            (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
+            (block.terminator = ContinueOp(IRValue[remap_ssa_ref(v, ctx.ssa_remap)
+                                                   for v in loop_ctx.carried_values]))
         return true
     elseif dest ∉ loop_ctx.loop_blocks
         block.terminator === nothing &&

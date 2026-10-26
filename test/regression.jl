@@ -1353,4 +1353,48 @@ end
     end
 end
 
+@testset "a carried value bound after the loop was entered" begin
+    # The inner loop exits from its header and from a break; both exits feed one
+    # phi, %13, right before the outer back edge. Once the inner loop's latch routes
+    # both exits, that block has a single predecessor and the walk renames %13 to
+    # the inner loop's result, after the outer loop collected %13 as a carried value.
+    slt(a, b) = Expr(:call, Core.Intrinsics.slt_int, a, b)
+    add(a, b) = Expr(:call, Core.Intrinsics.add_int, a, b)
+    ir = build_ir([
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 7], Any[0, SSAValue(13)]), Int), (slt(SSAValue(2), 3), Bool),
+                (GotoIfNot(SSAValue(3), 8), Any)], succs=[3, 8]),
+        (stmts=[(GotoNode(4), Any)], succs=[4]),
+        (stmts=[(PhiNode(Int32[3, 6], Any[SSAValue(2), SSAValue(9)]), Int),
+                (slt(SSAValue(6), 5), Bool), (GotoIfNot(SSAValue(7), 7), Any)], succs=[5, 7]),
+        (stmts=[(add(SSAValue(6), 1), Int), (slt(SSAValue(9), Argument(2)), Bool),
+                (GotoIfNot(SSAValue(10), 7), Any)], succs=[6, 7]),
+        (stmts=[(GotoNode(4), Any)], succs=[4]),
+        (stmts=[(PhiNode(Int32[4, 5], Any[SSAValue(6), SSAValue(9)]), Int),
+                (GotoNode(2), Any)], succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(2)), Any)], succs=Int[]),
+    ], Any[Any, Int])
+    function expected(n)
+        a = 0
+        while a < 3
+            b = a
+            while true
+                b < 5 || break
+                c = b + 1
+                if !(c < n)
+                    b = c
+                    break
+                end
+                b = c
+            end
+            a = b
+        end
+        a
+    end
+    for promote in (true, false)
+        sci = StructuredIRCode(ir; promote)              # validates
+        @test [execute(sci, n) for n in 0:6] == [expected(n) for n in 0:6]
+    end
+end
+
 end  # regression suite
