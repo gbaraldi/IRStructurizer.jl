@@ -84,4 +84,24 @@ end
     end
 end
 
+@testset "undef loop initial values" begin
+    # `y` escapes the loop, so it is carried with an `Undef` initial value. That
+    # must lower to an unassigned phi slot, not to the `Undef` object itself.
+    f_escape = function (n::Int)
+        i = 0
+        while true
+            y = i * 2
+            i += 1
+            i > n && return y + 1
+        end
+    end
+    @test @roundtrip f_escape(3)
+    sci, _ = only(code_structured(f_escape, Tuple{Int}))
+    ir = Core.Compiler.IRCode(sci)
+    phis = [s for s in ir.stmts.stmt if s isa PhiNode]
+    @test any(p -> !all(k -> isassigned(p.values, k), eachindex(p.values)), phis)
+    @test !any(p -> any(k -> isassigned(p.values, k) && p.values[k] isa Undef,
+                        eachindex(p.values)), phis)
+end
+
 end  # unstructurize
