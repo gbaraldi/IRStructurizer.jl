@@ -12,7 +12,13 @@ _term_targets(t::MReturn) = ()
 
 """A lightweight `CFG` over the mutable blocks (preds/succs only; statement
 ranges are placeholders) for dominance / SCC queries during normalization. Block
-indices equal MBlock ids, so results map straight back."""
+indices equal MBlock ids, so results map straight back.
+
+Unlike Julia's own CFG, preds/succs keep one entry per edge: a conditional branch
+with both edges to one block lists it twice, so that block is not a
+single-predecessor arm in `find_branch_regions`. Code collecting edges must
+therefore not pair this adjacency with `edge_refs`, which already returns every
+edge between two blocks."""
 function build_cfg(m::MCFG)
     nb = length(m.blocks)
     succs = [Int[] for _ in 1:nb]
@@ -349,8 +355,8 @@ function normalize_one_continuation!(m::MCFG)
         # reached from inside the continuation), so absorb=false.
         entryset = Set(entries)
         refs = EdgeRef[]
-        for b in sort!(collect(notcont)), succ in cfg.blocks[b].succs
-            succ in entryset && append!(refs, edge_refs(m, b, succ))
+        for b in sort!(collect(notcont)), r in _edge_refs_of(b, m.blocks[b].term)
+            edge_of(m, r).target in entryset && push!(refs, r)
         end
         single_entry_mux!(m, refs)
         return true
@@ -388,7 +394,7 @@ function normalize_one_preheader!(m::MCFG)
     for h in sort!(collect(keys(loops)))
         body = loops[h]
         entry_refs = EdgeRef[]
-        for p in sort!(collect(cfg.blocks[h].preds))
+        for p in sort!(unique(cfg.blocks[h].preds))
             p ∈ body && continue                      # back edge stays on the header
             append!(entry_refs, edge_refs(m, p, h))
         end
