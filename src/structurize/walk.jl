@@ -30,6 +30,9 @@ end
 
 Optional context for structurizing loop bodies. When present, back-edges to
 `header` become ContinueOp and edges outside `loop_blocks` become BreakOp.
+`carried_values` are collected before the walk, which may still rename them
+(`bind_single_pred_args!`), so they go through `ssa_remap` when the ContinueOp is
+emitted, like every other operand the walk emits.
 """
 struct LoopCtx
     header::Int
@@ -165,7 +168,8 @@ function resolve_loop_exit!(block::Block, ctx::StructurizeCtx, dest::Int,
                             loop_ctx::LoopCtx)
     if dest == loop_ctx.header
         block.terminator === nothing &&
-            (block.terminator = ContinueOp(copy(loop_ctx.carried_values)))
+            (block.terminator = ContinueOp(IRValue[remap_ssa_ref(v, ctx.ssa_remap)
+                                                   for v in loop_ctx.carried_values]))
         return true
     elseif dest ∉ loop_ctx.loop_blocks
         block.terminator === nothing &&
