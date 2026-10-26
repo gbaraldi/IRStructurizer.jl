@@ -162,24 +162,17 @@ end
  Merge result shape (block args + per-edge operands)
 =============================================================================#
 
-"""Read the merge block `merge_idx`'s block arguments as a [`MergeInfo`](@ref). The
-live arg positions, those some predecessor edge assigns a real (non-`Undef`)
-operand, become the `IfOp`'s results. An arg every predecessor leaves `Undef` is a
-dead phi slot and is dropped (no result). Returns `nothing` if no arg is live. This
-records only the result shape: each arm later yields its own edge's operands
-directly (`yield_to_merge!`), so there is no per-predecessor value map here."""
+"""Read the merge block `merge_idx`'s block arguments as a [`MergeInfo`](@ref), or
+`nothing` if it has none. Every argument becomes an `IfOp` result, including one
+that every predecessor leaves `Undef` (Julia's empty `φ()`): it is still a value
+its uses refer to, and the arms yield `undef` for it. This records only the result
+shape: each arm later yields its own edge's operands directly (`yield_to_merge!`)."""
 function merge_info(ctx::StructurizeCtx, merge_idx::Int)
     m = ctx.m::MCFG
     1 <= merge_idx <= length(m.blocks) || return nothing
     args = m.blocks[merge_idx].args
     isempty(args) && return nothing
-    preds = ctx.cfg.blocks[merge_idx].preds
-    positions = Int[]; ids = Int[]; types = Any[]
-    for (k, arg) in enumerate(args)
-        any(p -> (o = edge_operands(m, p, merge_idx); o !== nothing && !(o[k] isa Undef)), preds) || continue
-        push!(positions, k); push!(ids, arg); push!(types, get(ctx.types, arg, Any))
-    end
-    isempty(ids) ? nothing : MergeInfo(merge_idx, positions, ids, types)
+    return MergeInfo(merge_idx, copy(args), Any[get(ctx.types, arg, Any) for arg in args])
 end
 
 #=============================================================================
@@ -361,36 +354,29 @@ struct LoopPhiInfo
 end
 
 """Extract a loop header's block arguments, separating each into its entry value
-(operand on an edge from outside the loop) and carried value (operand on the back
-edge from inside the loop). The single-exiting latch and entry mux guarantee one
-of each, so an argument with only one side is malformed (a dead edge the optimizer
-left, or unexpected loop structure); error rather than emit wrong carries."""
+(operand on the edge from outside the loop) and carried value (operand on the back
+edge from inside the loop). Either may be `Undef`. The single-exiting latch and
+entry mux guarantee one edge of each kind, so a missing one is an internal error."""
 function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     m = ctx.m::MCFG
     result = LoopPhiInfo[]
     preds = ctx.cfg.blocks[header].preds
     for (k, arg) in enumerate(m.blocks[header].args)
-        entry_val = nothing
-        carried_val = nothing
+        entry_val = carried_val = nothing
+        has_entry = has_carried = false
         for p in preds
             ops = edge_operands(m, p, header)
             ops === nothing && continue
-            v = ops[k]
-            v isa Undef && continue
             if p ∈ loop_blocks
-                carried_val = v
+                carried_val = ops[k]; has_carried = true
             else
-                entry_val = v
+                entry_val = ops[k]; has_entry = true
             end
         end
-        if entry_val !== nothing && carried_val !== nothing
-            push!(result, LoopPhiInfo(arg, entry_val, carried_val))
-        elseif entry_val !== nothing || carried_val !== nothing
-            has_entry = entry_val !== nothing
-            error("internal error: loop header arg %$arg at BB$header has ",
-                  has_entry ? "entry" : "carried", " value but no ",
-                  has_entry ? "carried" : "entry", " value")
-        end
+        has_entry && has_carried ||
+            error("internal error: loop header arg %$arg at BB$header has no ",
+                  has_entry ? "back" : "entry", " edge")
+        push!(result, LoopPhiInfo(arg, entry_val, carried_val))
     end
     result
 end

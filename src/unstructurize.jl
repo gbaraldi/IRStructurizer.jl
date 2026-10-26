@@ -167,11 +167,26 @@ function lower_block_body!(ctx::UnstructurizeCtx, bb::Int, block::Block)
             cfop_old = stmt.args[2].id
             field_idx = stmt.args[3]::Int
             ctx.ssa_rename[idx] = ctx.cfop_results[cfop_old][field_idx]
+        elseif stmt isa Undef
+            emit_undef!(ctx, bb, idx, typ)
         else
             emit_resolved!(ctx, bb, idx, stmt, typ)
         end
     end
     return bb
+end
+
+"""Define `old_ssa` as undefined. Julia IR has no undef value, only a phi that has
+no value for the edge taken, so emit an empty `PhiNode` after the block's leading
+phis."""
+function emit_undef!(ctx::UnstructurizeCtx, bb::Int, old_ssa::Int, @nospecialize(typ))
+    stmts = ctx.bbs[bb].stmts
+    ssa = alloc_ssa!(ctx)
+    pos = something(findfirst(s -> !(s[2] isa PhiNode), stmts), length(stmts) + 1)
+    insert!(stmts, pos, (ssa, PhiNode(Int32[], Any[]), typ))
+    ctx.ssa_rename[old_ssa] = ssa
+    propagate_line!(ctx, ssa, old_ssa)
+    return ssa
 end
 
 #=============================================================================
@@ -346,8 +361,8 @@ function lower_forop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     carry_phis = PhiNode[]
     carry_phi_ssas = Int[]
     for (i, init_val) in enumerate(op.init_values)
-        init_resolved = resolve_value(ctx, init_val)
-        phi = PhiNode(Int32[bb], Any[init_resolved])
+        phi = PhiNode(Int32[], Any[])
+        push_phi_value!(phi, bb, resolve_value(ctx, init_val))
         carry_arg = op.body.args[i]
         phi_ssa = emit!(ctx, header_bb, phi, carry_arg.type)
         ctx.arg_rename[carry_arg.id] = phi_ssa
@@ -404,8 +419,8 @@ function lower_whileop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     carry_phis = PhiNode[]
     carry_phi_ssas = Int[]
     for (i, init_val) in enumerate(op.init_values)
-        init_resolved = resolve_value(ctx, init_val)
-        phi = PhiNode(Int32[bb], Any[init_resolved])
+        phi = PhiNode(Int32[], Any[])
+        push_phi_value!(phi, bb, resolve_value(ctx, init_val))
         carry_arg = op.before.args[i]
         phi_ssa = emit!(ctx, header_bb, phi, carry_arg.type)
         ctx.arg_rename[carry_arg.id] = phi_ssa
@@ -461,8 +476,8 @@ function lower_loopop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     carry_phis = PhiNode[]
     carry_phi_ssas = Int[]
     for (i, init_val) in enumerate(op.init_values)
-        init_resolved = resolve_value(ctx, init_val)
-        phi = PhiNode(Int32[bb], Any[init_resolved])
+        phi = PhiNode(Int32[], Any[])
+        push_phi_value!(phi, bb, resolve_value(ctx, init_val))
         carry_arg = op.body.args[i]
         phi_ssa = emit!(ctx, header_bb, phi, carry_arg.type)
         ctx.arg_rename[carry_arg.id] = phi_ssa

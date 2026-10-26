@@ -10,17 +10,14 @@
     MergeInfo
 
 The merge/continuation block of an `IfOp`, in block-argument form. `merge` is the
-block id; `positions` are the indices of its block args that are live (some
-predecessor edge carries a real, non-`Undef` operand) and so become `IfOp` results;
-`ids` and `types` are those args' stable ids and widened types. Built by
-[`merge_info`](@ref).
+block id; `ids` and `types` are its block args' stable ids and widened types, which
+become the `IfOp`'s results. Built by [`merge_info`](@ref).
 
 Each arm's `YieldOp` is then the operands its own exit edge carries to `merge`,
 read position by position via `edge_operands(m, arm_exit, merge)`.
 """
 struct MergeInfo
     merge::Int
-    positions::Vector{Int}
     ids::Vector{Int}
     types::Vector{Any}
 end
@@ -375,8 +372,8 @@ function emit_branch!(block::Block, ctx::StructurizeCtx, current::Int,
 end
 
 """Set `blk`'s terminator to the `YieldOp` carrying what `exit_block` contributes
-to `minfo.merge`: for each live merge-arg position, the operand on edge `exit_block`
-to `merge` (`edge_operands`), remapped through `ssa_remap`.
+to `minfo.merge`: for each merge arg, the operand on edge `exit_block` to `merge`
+(`edge_operands`), remapped through `ssa_remap`.
 
 An `Undef` (an unassigned phi slot) or a missing edge (`exit_block` does not reach
 the merge, e.g. a diverged arm whose yield is dead) becomes a typed `Undef`. If the
@@ -386,8 +383,8 @@ the raw edge operand."""
 function yield_to_merge!(blk::Block, ctx::StructurizeCtx, exit_block::Int, minfo::MergeInfo)
     ops = edge_operands(ctx.m::MCFG, exit_block, minfo.merge)
     vals = IRValue[]
-    for (j, k) in enumerate(minfo.positions)
-        v = ops === nothing ? Undef(minfo.types[j]) : ops[k]
+    for j in eachindex(minfo.ids)
+        v = ops === nothing ? Undef(minfo.types[j]) : ops[j]
         if v isa Undef
             push!(vals, Undef(minfo.types[j]))
         else
