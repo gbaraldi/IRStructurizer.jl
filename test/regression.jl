@@ -185,6 +185,28 @@ end
     @test execute(sci, false) === 0.0
 end
 
+@testset "unreachable blocks" begin
+    # i = 0; while (i += 1) < n; end; return i, plus dead blocks: BB4 feeds the
+    # loop header a value it defines, BB6 is a dead cycle.
+    ir = build_ir([
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 3, 4], Any[0, SSAValue(3), SSAValue(7)]), Int),
+                (Expr(:call, GlobalRef(Base, :add_int), SSAValue(2), 1), Int),
+                (Expr(:call, GlobalRef(Base, :slt_int), SSAValue(3), Argument(2)), Bool),
+                (GotoIfNot(SSAValue(4), 5), Any)], succs=[5, 3]),
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(Expr(:call, GlobalRef(Base, :add_int), Argument(2), 1), Int),
+                (GotoNode(2), Any)], succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(3)), Any)], succs=Int[]),
+        (stmts=[(GotoNode(6), Any)], succs=[6]),
+    ], Any[Any, Int])
+    @test length(IRStructurizer.ingest(ir).blocks) == 4
+    sci = StructuredIRCode(ir)
+    for n in (0, 1, 5)
+        @test execute(sci, n) == max(n, 1)
+    end
+end
+
 if isdefined(Core, :getglobal_partition)
 @testset "phi operand is a binding partition" begin
     # Julia 1.14 replaces the `GlobalRef` above with the binding partition the

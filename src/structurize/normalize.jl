@@ -45,6 +45,8 @@ function normalize_one_irreducible!(m::MCFG)
 
     by_scc = Dict{Int, Vector{Int}}()
     for bb in 1:nb
+        # `irreducible` is only initialized for reachable blocks
+        @assert !CC.bb_unreachable(reach, bb) "unreachable block $bb in the MCFG"
         CC.bb_in_irreducible_loop(reach, bb) && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
     end
     isempty(by_scc) && return false
