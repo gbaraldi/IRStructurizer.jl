@@ -605,6 +605,27 @@ end
     end
 end
 
+@testset "single-predecessor argument of a constant" begin
+    # Block 2's phi has one predecessor and a constant operand: the walk copies the
+    # constant to the phi's id. Anchoring that copy's line to itself made
+    # `resolve_line` loop forever (on 1.12+, every statement has a line entry).
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 3), Any)],                     succs=[2, 3]),
+        (stmts=[(PhiNode(Int32[1], Any[7]), Int),
+                (GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(PhiNode(Int32[2, 3], Any[SSAValue(2), 0]), Int),
+                (ReturnNode(SSAValue(5)), Any)],                       succs=Int[]),
+    ], Any[Any, Bool])
+    sci = StructuredIRCode(ir)
+    selfanchored = any(((k, v),) -> v == k, sci.line_map)
+    @test !selfanchored
+    if !selfanchored            # lowering would never return
+        @test execute(sci, true) === 7
+        @test execute(sci, false) === 0
+    end
+end
+
 @testset "PiNode carry and :invoke closure" begin
     # A value used through a PiNode after the loop must be threaded out.
     function pi_carry(v::Vector{Any}, n::Int)

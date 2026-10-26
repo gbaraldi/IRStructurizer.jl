@@ -222,8 +222,8 @@ function bind_single_pred_args!(block::Block, ctx::StructurizeCtx, b::Int)
         elseif v isa SSAValue
             ctx.ssa_remap[arg] = v.id
         else
-            push!(block, arg, v, get(ctx.types, arg, Any))   # constant / argument / undef copy
-            anchor_line!(ctx, arg, arg)
+            # A constant / argument / undef copy. It keeps the arg's own line entry.
+            push!(block, arg, v, get(ctx.types, arg, Any))
         end
     end
 end
