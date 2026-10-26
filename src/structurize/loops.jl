@@ -284,17 +284,6 @@ function emit_loop!(block::Block, ctx::StructurizeCtx, header::Int,
         push!(body.args, arg)
     end
 
-    # Remap header phi carried values that reference extra exit SSAs
-    if !isempty(ctx.ssa_remap)
-        n_header = length(phi_info)
-        for i in 1:n_header
-            v = carried_values[i]
-            if v isa SSAValue
-                carried_values[i] = SSAValue(get(ctx.ssa_remap, v.id, v.id))
-            end
-        end
-    end
-
     # 5. Build loop body
     build_loop_body!(body, ctx, header, loop_blocks, carried_values, subs)
 
