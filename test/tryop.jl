@@ -28,6 +28,29 @@ function tryop_sci()
     return StructuredIRCode(Any[Any, Int], Any[], entry, 10)
 end
 
+"""`f(x) = try (x < 0 && exit with -3x); tryop_g(x) catch; 0 end`, by hand: the exit
+from the IfOp arm leaves the try body with a `LeaveOp`."""
+function tryop_leave_sci()
+    entry = Block()
+    body = Block()
+    push!(body, 3, Expr(:call, Core.Intrinsics.slt_int, Core.Argument(2), 0), Bool)
+    then_blk = Block()
+    push!(then_blk, 9, Expr(:call, Core.Intrinsics.mul_int, Core.Argument(2), -3), Int)
+    then_blk.terminator = LeaveOp(IRValue[SSAValue(9)])
+    else_blk = Block()
+    else_blk.terminator = YieldOp()
+    push!(body, 8, IfOp(SSAValue(3), then_blk, else_blk), Nothing)
+    push!(body, 10, Expr(:call, GlobalRef(@__MODULE__, :tryop_g), Core.Argument(2)), Int)
+    body.terminator = YieldOp(IRValue[SSAValue(10)])
+    handler = Block()
+    push!(handler, 4, Expr(:pop_exception, SSAValue(2)), Nothing)
+    handler.terminator = YieldOp(IRValue[0])
+    push!(entry, 2, TryOp(body, handler), Tuple{Int})
+    push!(entry, 5, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    entry.terminator = ReturnNode(SSAValue(5))
+    return StructuredIRCode(Any[Any, Int], Any[], entry, 20)
+end
+
 tryop_of(sci) = only(e.stmt for (_, e) in sci.entry.body if e.stmt isa TryOp)
 
 @testset "TryOp and LeaveOp" begin
@@ -53,6 +76,39 @@ tryop_of(sci) = only(e.stmt for (_, e) in sci.entry.body if e.stmt isa TryOp)
     @test IRStructurizer.operands(leave) == IRValue[SSAValue(3)]
     @test isempty(IRStructurizer.operands(LeaveOp()))
     @test leave isa IRStructurizer.Terminator
+end
+
+@testset "printing" begin
+    @test @filecheck begin
+        @check "%1 = ϒ (_2)"
+        @check "%2 = try -> Tuple{Int64}"
+        @check "body:"
+        @check "tryop_g(_2)"
+        @check "yield %3"
+        @check "catch(%arg1::Int64 ← ϒ[%1]):"
+        @check "pop_exception %2"
+        @check "yield %6"
+        @check "getfield(%2, 1)"
+        tryop_sci()
+    end
+    @test @filecheck begin
+        @check "try -> Tuple{Int64}"
+        @check "if %3"
+        @check "leave %9"
+        @check "catch:"
+        tryop_leave_sci()
+    end
+    @test sprint(show, TryOp(Block(), nothing)) == "TryOp(scope-only)"
+    # A scope-only try shows its scope, here an empty one, and no catch region.
+    entry = Block()
+    body = Block(); body.terminator = YieldOp()
+    push!(entry, 1, TryOp(body, nothing, Vector{Int}[], nothing), Nothing)
+    entry.terminator = ReturnNode(nothing)
+    @test @filecheck begin
+        @check "try scope nothing"
+        @check_not "catch"
+        StructuredIRCode(Any[Any], Any[], entry, 2)
+    end
 end
 
 end  # TryOp and LeaveOp
