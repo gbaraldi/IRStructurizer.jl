@@ -26,8 +26,9 @@ each block become block arguments; the values they carry per predecessor become
 that predecessor edge's operands. Stable ids == original SSA positions.
 
 An `EnterNode` throws `UnstructuredControlFlowError` unless `exceptions` is
-`:structured`. Then it becomes an `MEnter` terminator, and each `Expr(:leave, ...)`
-is split into blocks of its own that pop one handler each (`split_leaves!`). See
+`:structured`. Then it becomes an `MEnter` terminator, each `Expr(:leave, ...)` is
+split into blocks of its own that pop one handler each (`split_leaves!`), and the
+`pop_exception`s are moved to where their catch's handler runs. See
 `structurize/exceptions.jl`.
 """
 function ingest(ir::IRCode; exceptions::Symbol=:error)
@@ -111,7 +112,10 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
     m = MCFG(blocks, 1, types, codelocs,
              length(ir.stmts.stmt) + 1,
              copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds, has_eh)
-    has_eh && split_leaves!(m)
+    if has_eh
+        hoist_pops_over_leaves!(m)
+        split_leaves!(m)
+    end
     fold_undef_args!(m)
     return m
 end
