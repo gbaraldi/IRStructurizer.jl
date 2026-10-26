@@ -140,4 +140,116 @@ end
     @test isempty(uses(blk, nothing))
 end
 
+@testset "validation" begin
+    invalid(sci) = try validate_terminators(sci); "" catch e; e.msg end
+    @test validate_terminators(tryop_sci()) && validate_ssa_defs(tryop_sci())
+    @test validate_terminators(tryop_leave_sci()) && validate_ssa_defs(tryop_leave_sci())
+    # The body yield must carry the op's one result, of its type.
+    sci = tryop_sci(); op = tryop_of(sci)
+    op.body.terminator = YieldOp()
+    @test occursin("body yield carries 0 values", invalid(sci))
+    op.body.terminator = YieldOp(Any["str"])
+    @test occursin("not <: declared Int64", invalid(sci))
+    # A value return inside the body would skip leaving the try.
+    op.body.terminator = ReturnNode(42)
+    @test occursin("value return inside the body", invalid(sci))
+    # A LeaveOp out of a nested arm carries the op's results too.
+    sci = tryop_leave_sci(); op = tryop_of(sci)
+    ifop = only(e.stmt for (_, e) in op.body.body if e.stmt isa IfOp)
+    ifop.then_region.terminator = LeaveOp()
+    @test occursin("leave carries 0 values", invalid(sci))
+    # Upsilons name UpsilonNode statements.
+    sci = tryop_sci(); op = tryop_of(sci)
+    push!(op.upsilons[1], 3)
+    @test occursin("upsilon %3 of handler argument 1 is not an UpsilonNode", invalid(sci))
+    # ... that runs before the handler can: in the body or before the op, not after
+    # it or in the handler.
+    sci = tryop_sci(); op = tryop_of(sci)
+    push!(sci.entry, 11, Core.UpsilonNode(Core.Argument(2)), Nothing)
+    push!(op.handler, 12, Core.UpsilonNode(Core.Argument(2)), Nothing)
+    op.upsilons[1] = [1, 11, 12]
+    @test occursin("upsilon %11 of handler argument 1 is neither in the body nor before the op", invalid(sci))
+    @test occursin("upsilon %12 of handler argument 1 is neither", invalid(sci))
+    @test !occursin("upsilon %1 ", invalid(sci))
+    # An upsilon in an op before the try runs before it too.
+    sci = tryop_sci(); op = tryop_of(sci)
+    arm = Block(); push!(arm, 13, Core.UpsilonNode(Core.Argument(2)), Nothing)
+    arm.terminator = YieldOp()
+    other = Block(); other.terminator = YieldOp()
+    entry = Block()
+    push!(entry, 14, IfOp(true, arm, other), Nothing)
+    for (i, e) in sci.entry.body
+        push!(entry, i, e.stmt, e.type)
+    end
+    entry.terminator = sci.entry.terminator
+    op.upsilons[1] = [1, 13]
+    @test invalid(StructuredIRCode(Any[Any, Int], Any[], entry, 20)) == ""
+    # An upsilon feeds a single handler argument.
+    sci = tryop_sci(); op = tryop_of(sci)
+    push!(op.handler.args, BlockArgument(2, Int))
+    push!(op.upsilons, [1])
+    @test occursin("upsilon %1 of handler argument 2 also feeds another", invalid(sci))
+    # One upsilon list per handler argument, none without a handler; no body arguments.
+    sci = tryop_sci(); op = tryop_of(sci)
+    push!(op.upsilons, Int[])
+    @test occursin("2 upsilon lists for 1 handler arguments", invalid(sci))
+    @test occursin("1 upsilon lists for 0 handler arguments",
+                   invalid(StructuredIRCode(Any[Any], Any[],
+                       (b = Block(); push!(b, 1, TryOp(Block(), nothing, [Int[]]), Nothing); b), 1)))
+    sci = tryop_sci(); op = tryop_of(sci)
+    push!(op.body.args, BlockArgument(2, Int))
+    @test occursin("body has 1 arguments", invalid(sci))
+    # %t is read with getfield and named by pop_exception, and used no other way.
+    sci = tryop_sci()
+    sci.entry.terminator = ReturnNode(SSAValue(2))
+    @test occursin("%2 used other than by getfield or pop_exception", invalid(sci))
+    sci = tryop_sci(); op = tryop_of(sci)
+    push!(op.handler, 7, Expr(:call, Core.getfield, SSAValue(2), 1), Int)
+    @test occursin("TryOp at %2: its result is read inside it", invalid(sci))
+    # A LeaveOp exits a try body only: not the handler of the outermost try, not
+    # a loop inside a body, and not code without a TryOp.
+    sci = tryop_sci(); op = tryop_of(sci)
+    op.handler.terminator = LeaveOp(IRValue[0])
+    @test occursin("LeaveOp outside a TryOp body", invalid(sci))
+    sci = tryop_leave_sci(); op = tryop_of(sci)
+    loop_body = Block(); loop_body.terminator = LeaveOp()
+    push!(op.body, 11, LoopOp(loop_body, IRValue[]), Tuple{})
+    @test occursin("LeaveOp outside a TryOp body", invalid(sci))
+    blk = Block(); blk.terminator = LeaveOp()
+    @test occursin("LeaveOp outside a TryOp body",
+                   invalid(StructuredIRCode(Any[Any], Any[], blk, 1)))
+    # Nor may a BreakOp or ContinueOp exit a body, which would skip the leave, or a
+    # handler; one that exits a loop inside the body is fine.
+    sci = tryop_leave_sci(); op = tryop_of(sci)
+    ifop = only(e.stmt for (_, e) in op.body.body if e.stmt isa IfOp)
+    ifop.then_region.terminator = BreakOp()
+    @test occursin("BreakOp out of a TryOp", invalid(sci))
+    ifop.then_region.terminator = ContinueOp()
+    @test occursin("ContinueOp out of a TryOp", invalid(sci))
+    sci = tryop_leave_sci(); op = tryop_of(sci)
+    then_blk = Block(); then_blk.terminator = BreakOp()
+    else_blk = Block(); else_blk.terminator = YieldOp()
+    push!(op.handler, 12, IfOp(true, then_blk, else_blk), Nothing)
+    @test occursin("BreakOp out of a TryOp", invalid(sci))
+    sci = tryop_leave_sci(); op = tryop_of(sci)
+    loop_body = Block(); loop_body.terminator = BreakOp()
+    push!(op.body, 11, LoopOp(loop_body, IRValue[]), Tuple{})
+    @test invalid(sci) == ""
+    # `pop_exception %t` is scoped like any use of %t: after the TryOp in its own
+    # region it is in scope, after the IfOp whose arm holds the TryOp it is not.
+    sci = tryop_sci()
+    push!(sci.entry, 7, Expr(:pop_exception, SSAValue(2)), Nothing)
+    @test validate_ssa_defs(sci)
+    arm = Block()
+    push!(arm, 2, tryop_of(tryop_sci()), Tuple{Int})
+    arm.terminator = YieldOp()
+    entry = Block()
+    push!(entry, 1, Core.UpsilonNode(Core.Argument(2)), Nothing)
+    push!(entry, 8, IfOp(true, arm, (b = Block(); b.terminator = YieldOp(); b)), Nothing)
+    push!(entry, 7, Expr(:pop_exception, SSAValue(2)), Nothing)
+    entry.terminator = ReturnNode(nothing)
+    @test_throws "SSA values used but not defined: %2" validate_ssa_defs(
+        StructuredIRCode(Any[Any, Int], Any[], entry, 10))
+end
+
 end  # TryOp and LeaveOp
