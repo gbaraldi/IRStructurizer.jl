@@ -79,6 +79,15 @@ function Base.setindex!(r::PiNodeUseRef, @nospecialize(v))
     r.stmts[r.pos] = PiNode(v, (r.stmts[r.pos]::PiNode).typ)
 end
 
+# UseRef for an UpsilonNode statement (immutable, so replacement reconstructs it).
+struct UpsilonNodeUseRef <: UseRef
+    stmts::Vector{Any}
+    pos::Int
+end
+
+Base.getindex(r::UpsilonNodeUseRef) = (r.stmts[r.pos]::Core.UpsilonNode).val
+Base.setindex!(r::UpsilonNodeUseRef, @nospecialize(v)) = (r.stmts[r.pos] = Core.UpsilonNode(v))
+
 """
     walk_uses!(f, node)
 
@@ -102,6 +111,9 @@ function walk_uses!(f, block::Block)
         elseif stmt isa PiNode
             # PiNode as a statement wraps a single value with type narrowing.
             f(PiNodeUseRef(block.body.stmts, i))
+        elseif stmt isa Core.UpsilonNode
+            # The value a TryOp handler argument takes if the body throws later.
+            isdefined(stmt, :val) && f(UpsilonNodeUseRef(block.body.stmts, i))
         elseif is_value_like_stmt(stmt)
             # Alias/forwarding statement: stmt IS a value (SSAValue, BlockArgument,
             # Argument, SlotNumber). Replacement swaps the stmt slot directly.
@@ -157,8 +169,16 @@ function walk_uses!(f, op::Union{WhileOp, LoopOp})
     for b in blocks(op); walk_uses!(f, b); end
 end
 
+# The `upsilons` lists name statements (tokens), not values, so they are not uses:
+# `uses` and `replace_uses!` leave them alone. A pass that moves, clones or deletes
+# an `UpsilonNode` updates the lists itself.
+function walk_uses!(f, op::TryOp)
+    has_scope(op) && f(MutableFieldUseRef(op, :scope))
+    for b in blocks(op); walk_uses!(f, b); end
+end
+
 # Terminators
-function walk_uses!(f, term::Union{ContinueOp, BreakOp, YieldOp})
+function walk_uses!(f, term::Union{ContinueOp, BreakOp, YieldOp, LeaveOp})
     vals = operands(term)
     for i in 1:length(vals); f(IndexedUseRef(vals, i)); end
 end
@@ -307,12 +327,16 @@ function _references(@nospecialize(stmt), @nospecialize(target))
             for v in stmt.init_values
                 normalize_key(v) === target && return true
             end
+        elseif stmt isa TryOp
+            has_scope(stmt) && normalize_key(stmt.scope) === target && return true
         end
     elseif stmt isa ReturnNode
         isdefined(stmt, :val) || return false
         normalize_key(stmt.val) === target && return true
     elseif stmt isa PiNode
         normalize_key(stmt.val) === target && return true
+    elseif stmt isa Core.UpsilonNode
+        isdefined(stmt, :val) && normalize_key(stmt.val) === target && return true
     elseif is_value_like_stmt(stmt)
         # Alias statement: the stmt itself is the referenced value.
         normalize_key(stmt) === target && return true

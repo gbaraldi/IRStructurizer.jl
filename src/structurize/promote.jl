@@ -378,6 +378,10 @@ function _refs_ssa(@nospecialize(val), ssa::SSAValue)
         return any(v -> v === ssa, val.values)
     elseif val isa BreakOp
         return any(v -> v === ssa, val.values)
+    elseif val isa LeaveOp
+        return any(v -> v === ssa, val.values)
+    elseif val isa Core.UpsilonNode
+        return isdefined(val, :val) && val.val === ssa
     elseif val isa ReturnNode
         return isdefined(val, :val) && val.val === ssa
     end
@@ -398,6 +402,9 @@ function _refs_ssa_deep(@nospecialize(val), ssa::SSAValue)
                _refs_ssa_deep(val.before, ssa) || _refs_ssa_deep(val.after, ssa)
     elseif val isa LoopOp
         return any(v -> _refs_ssa(v, ssa), val.init_values) || _refs_ssa_deep(val.body, ssa)
+    elseif val isa TryOp
+        return (has_scope(val) && _refs_ssa(val.scope, ssa)) ||
+               any(b -> _refs_ssa_deep(b, ssa), blocks(val))
     elseif val isa Block
         for (_, e) in val.body
             _refs_ssa_deep(e.stmt, ssa) && return true
@@ -1005,6 +1012,17 @@ function remap_value(@nospecialize(val), remap::Dict{Int, BlockArgument})
         return ContinueOp(IRValue[remap_value(v, remap) for v in val.values])
     elseif val isa BreakOp
         return BreakOp(IRValue[remap_value(v, remap) for v in val.values])
+    elseif val isa LeaveOp
+        return LeaveOp(IRValue[remap_value(v, remap) for v in val.values])
+    elseif val isa Core.UpsilonNode
+        isdefined(val, :val) || return val
+        return Core.UpsilonNode(remap_value(val.val, remap))
+    elseif val isa TryOp
+        has_scope(val) && (val.scope = remap_value(val.scope, remap))
+        for b in blocks(val)
+            remap_block_args!(b, remap)
+        end
+        return val
     elseif val isa ConditionOp
         return ConditionOp(remap_value(val.condition, remap),
                            IRValue[remap_value(v, remap) for v in val.args])
