@@ -26,7 +26,21 @@ MEdge(target::Int) = MEdge(target, Any[])
 struct MGoto;   edge::MEdge;                       end
 struct MCondBr; cond::Any; t::MEdge; f::MEdge;      end   # GotoIfNot: true=t, false=f
 struct MReturn; val::Any; has_val::Bool;           end    # ReturnNode(val) / ReturnNode()
-const MTerm = Union{MGoto, MCondBr, MReturn}
+
+"""The `EnterNode` terminator. `id` is the `EnterNode`'s stable id (the `TryOp`'s SSA
+index). `body` is the fallthrough edge into the protected region. `catch_dest` is the
+handler entry block, reached by the implicit exceptional edge, or 0 for a scope-only
+enter (no handler). `scope` is the scope operand, or `nothing`. The exceptional edge
+carries no operands: values reach the handler through `UpsilonNode`/`PhiCNode`
+statements. Normalization never redirects either edge (see `try_info`)."""
+mutable struct MEnter
+    id::Int
+    body::MEdge
+    catch_dest::Int
+    scope::Any
+end
+
+const MTerm = Union{MGoto, MCondBr, MReturn, MEnter}
 
 MReturn() = MReturn(nothing, false)        # unreachable / throw dead-end (no value)
 
@@ -59,7 +73,9 @@ MBlock() = MBlock(Int[], MStmt[], MReturn(), (Int32(0), Int32(0), Int32(0)))
 """The whole mutable CFG. Blocks are indexed by id == position in `blocks`; the
 vector only ever grows (mux/trampoline blocks appended), so ids are stable.
 `types`/`codelocs` cover block-argument and synthesized ids; body-statement
-types/codelocs live in the `MStmt`s."""
+types/codelocs live in the `MStmt`s. `has_eh` records whether any block ends in an
+`MEnter`; only `ingest` creates them, so it is set once there and lets the passes
+skip the try analyses for code without exception handling."""
 mutable struct MCFG
     blocks::Vector{MBlock}
     entry::Int
@@ -71,6 +87,7 @@ mutable struct MCFG
     sptypes::Vector{Any}
     debuginfo::Any
     valid_worlds::Any
+    has_eh::Bool                       # some block ends in an `MEnter`
 end
 
 alloc_id!(m::MCFG) = (id = m.next_id; m.next_id += 1; id)
