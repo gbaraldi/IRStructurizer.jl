@@ -27,6 +27,17 @@ function build_cfg(m::MCFG)
     return CFG(bbs, collect(1:nb))
 end
 
+"""The blocks of each irreducible SCC, by SCC id. `reach.irreducible` is allocated
+uninitialized and only written for reachable blocks, so unreachable ones are skipped."""
+function irreducible_sccs(reach::CFGReachability, nb::Int)
+    by_scc = Dict{Int, Vector{Int}}()
+    for bb in 1:nb
+        CC.bb_unreachable(reach, bb) && continue
+        CC.bb_in_irreducible_loop(reach, bb) && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
+    end
+    return by_scc
+end
+
 """Find one irreducible (multi-entry) SCC and collapse its entry blocks to a
 single entry with a mux (MLIR's `createSingleEntryBlock` over entry and back
 edges). Returns `true` if it muxed one, `false` if the CFG has no irreducible
@@ -36,10 +47,7 @@ function normalize_one_irreducible!(m::MCFG, cfg::CFG=build_cfg(m),
     reach = CFGReachability(cfg, domtree)
     nb = length(m.blocks)
 
-    by_scc = Dict{Int, Vector{Int}}()
-    for bb in 1:nb
-        CC.bb_in_irreducible_loop(reach, bb) && push!(get!(Vector{Int}, by_scc, reach.scc[bb]), bb)
-    end
+    by_scc = irreducible_sccs(reach, nb)
     isempty(by_scc) && return false
 
     # Deterministic pick: smallest SCC id, entry blocks sorted.
