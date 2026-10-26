@@ -327,7 +327,17 @@ that continuation through one mux (MLIR `createSingleEntryBlock` for the
 continuation), making it single-entry. Returns `true` if it muxed one. After this
 the lift's ordinary IfOp path handles short-circuits, N-way merges, and nested
 gated bodies uniformly, with `find_branch_regions` always finding a singleton
-merge."""
+merge.
+
+A branch whose continuation edges all leave one arm is skipped while another
+branch has a continuation to mux. Its other arm adds no edges into the continuation
+(it throws, as in `x > 1 && throw()`, returns, or leaves an enclosing loop), so the
+first arm's entry dominates every edge into the mux, and the mux would join that
+arm: the next round would find the same continuation entries again. The entries are
+reached from outside the branch too (otherwise the arm would dominate them), so the
+branches around it can join those paths, possibly over several rounds, until this
+continuation is single-entry. Only when no other branch is left is such a branch
+muxed as before."""
 function normalize_one_continuation!(m::MCFG, cfg::CFG=build_cfg(m),
                                      domtree::DomTree=construct_domtree(cfg),
                                      loops=natural_loops_m(m, cfg, domtree))
@@ -338,9 +348,12 @@ function normalize_one_continuation!(m::MCFG, cfg::CFG=build_cfg(m),
 end
 
 """The first conditional (by block index, from `start`) with a multi-entry continuation,
-and the edges into that continuation: `(E, refs)`, or `nothing`."""
+and the edges into that continuation: `(E, refs, absorbed)`, or `nothing`. A branch
+whose arm would absorb the mux (`absorbed`, see `normalize_one_continuation!`) is
+returned only when no other branch from `start` has one."""
 function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::Int=1)
     all_blocks = Set(1:length(m.blocks))
+    absorbed = nothing     # the first branch whose mux its arm would absorb
     for E in start:length(m.blocks)
         t = m.blocks[E].term
         t isa MCondBr || continue
@@ -361,9 +374,13 @@ function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::In
         for b in sort!(collect(notcont)), succ in cfg.blocks[b].succs
             succ in entryset && append!(refs, edge_refs(m, b, succ))
         end
-        return E, refs
+        if all(r -> r.src in then_blocks, refs) || all(r -> r.src in else_blocks, refs)
+            absorbed === nothing && (absorbed = (E, refs, true))
+            continue
+        end
+        return E, refs, false
     end
-    return nothing
+    return absorbed
 end
 
 #=============================================================================
@@ -431,7 +448,7 @@ function normalize_cf!(m::MCFG)
             # The continuation scan resumes at the branch it muxed last, and scans from the
             # start again before concluding that none is left.
             found = find_continuation(m, cfg, domtree, loops; start=cursor)
-            if found === nothing && cursor > 1
+            if (found === nothing || found[3]) && cursor > 1
                 found = find_continuation(m, cfg, domtree, loops)
             end
             if found !== nothing

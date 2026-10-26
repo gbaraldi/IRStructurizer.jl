@@ -131,6 +131,34 @@ end
     end
 end
 
+@testset "a continuation that one arm of its branch would absorb" begin
+    # `x > 1 && error(..)` has one arm that throws, so every edge into its
+    # continuation leaves the other arm, which then dominates the mux: muxing at
+    # that branch made the mux part of the arm, and the next round found the same
+    # two continuation entries (the `break` and the fall-through), without end.
+    # The enclosing branch, which joins those paths with the `x > 8` arm's, muxes
+    # them first.
+    function cont_absorbed(x)
+        w = 0
+        while w < 3
+            w += 1
+            if x > 8
+                x > 9 && continue
+            else
+                x > 1 && error("absorbed")
+                x > -2 && break
+            end
+            break
+        end
+        10x + w             # which path ran
+    end
+    sci, _ = code_structured(cont_absorbed, Tuple{Int}) |> only     # validates
+    for x in (-5, -2, 0, 1, 9, 10, 12)
+        @test execute(sci, x) == cont_absorbed(x)
+    end
+    @test_throws ErrorException execute(sci, 5)
+end
+
 @testset "short-circuit || body emitted once" begin
     # `if a || b { body }` — body is the multi-entry continuation reached from
     # both arms. The edge multiplexer emits it exactly once (no tail duplication).
