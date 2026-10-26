@@ -701,4 +701,31 @@ end
     @test any(s -> s isa Core.PhiCNode, first(only(code_ircode(eh_lazy, (Int,)))).stmts.stmt)
 end
 
+@testset "normalize_cf! gives every try a single continuation" begin
+    # Afterwards the edges out of a try's body and handler reach one block, which
+    # is not a loop header, and a loop that contains a try contains all of it.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        IRStructurizer.normalize_cf!(m)
+        loops = IRStructurizer.natural_loops_m(m)
+        for r in values(try_info(m))
+            targets = unique(edge_of(m, ref).target for ref in try_exit_refs(m, r))
+            @test length(targets) <= 1
+            @test !any(in(keys(loops)), targets)
+            for body in values(loops)
+                r.block in body && @test issubset(IRStructurizer.construct_blocks(r), body)
+            end
+        end
+    end
+    # A catch block also reached by ordinary control flow (after a leave) is not
+    # something Julia's lowering produces, and is rejected.
+    ir = build_ir([
+        (stmts=[(Core.EnterNode(3), Any)],                       succs=[3, 2]),
+        (stmts=[(Expr(:leave, SSAValue(1)), Any), (GotoNode(3), Any)], succs=[3]),
+        (stmts=[(ReturnNode(1), Any)],                           succs=Int[]),
+    ], Any[Any, Int])
+    @test_throws UnstructuredControlFlowError IRStructurizer.normalize_cf!(
+        ingest(ir; exceptions=:structured))
+end
+
 end  # exceptions

@@ -83,7 +83,12 @@ end
 # single-exiting latch ---------------------------------------------------------
 
 """Natural loops on the MBlock CFG: header id to set of in-loop block ids. A back
-edge is `src->header` where `header` dominates `src`."""
+edge is `src->header` where `header` dominates `src`.
+
+A loop that contains an `MEnter` also contains that try's whole protected region
+and handler (`extend_loops_over_trys!`), so a throwing dead end in the region, or
+a handler that leaves the loop, stays inside the `TryOp` instead of becoming a
+loop exit that the latch would hoist out of the try."""
 function natural_loops_m(m::MCFG, cfg::CFG=build_cfg(m),
                          domtree::DomTree=construct_domtree(cfg))
     loops = Dict{Int, Set{Int}}()
@@ -102,6 +107,7 @@ function natural_loops_m(m::MCFG, cfg::CFG=build_cfg(m),
             end
         end
     end
+    has_enter(m) && extend_loops_over_trys!(loops, m, domtree)
     return loops
 end
 
@@ -374,6 +380,9 @@ whose arm would absorb the mux (`absorbed`, see `normalize_one_continuation!`) i
 returned only when no other branch from `start` has one."""
 function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::Int=1)
     all_blocks = Set(1:length(m.blocks))
+    # Edges that leave a try body enclosing the branch become `LeaveOp`s in the
+    # lift, not continuation entries; `depth` lets `branch_continuation` skip them.
+    depth = has_enter(m) ? handler_depths(m) : nothing
     absorbed = nothing     # the first branch whose mux its arm would absorb
     for E in start:length(m.blocks)
         t = m.blocks[E].term
@@ -381,9 +390,11 @@ function find_continuation(m::MCFG, cfg::CFG, domtree::DomTree, loops; start::In
         true_dest, false_dest = t.t.target, t.f.target
         lctx = enclosing_loop_ctx(loops, E)
         then_blocks, else_blocks, _ =
-            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx; find_merge=false)
+            find_branch_regions(cfg, domtree, E, true_dest, false_dest, all_blocks, lctx;
+                                find_merge=false, depth)
         entries, notcont = branch_continuation(cfg, domtree, E, true_dest, false_dest,
-                                               then_blocks, else_blocks, all_blocks, lctx)
+                                               then_blocks, else_blocks, all_blocks, lctx;
+                                               depth)
         length(entries) > 1 || continue
 
         # The continuation edges: every edge from a branch-region block (notcont)
@@ -457,10 +468,13 @@ function normalize_cf!(m::MCFG)
     cursor = 1
     while true
         # The CFG, dominator tree and loops are computed once per round: each pass ends
-        # the round when it mutates.
+        # the round when it mutates. Try regions go first: once each `TryOp` has a
+        # single continuation, the other passes only ever redirect edges between blocks
+        # that hold the same handlers.
         cfg = build_cfg(m)
         domtree = construct_domtree(cfg)
-        mutated = normalize_one_irreducible!(m, cfg, domtree)
+        mutated = normalize_one_try!(m, cfg, domtree)
+        mutated || (mutated = normalize_one_irreducible!(m, cfg, domtree))
         if !mutated
             loops = natural_loops_m(m, cfg, domtree)
             mutated = normalize_one_loop_latch!(m, loops)
@@ -484,8 +498,15 @@ function normalize_cf!(m::MCFG)
         cursor = resumed
         changed = true
         guard += 1
-        guard > 8 * limit && error("normalize_cf! failed to converge (likely a mux bug)")
+        if guard > 8 * limit
+            # A try whose handler region keeps absorbing the muxes built for its
+            # exits is a shape the try analyses do not support; say so.
+            has_enter(m) && throw(UnstructuredControlFlowError(
+                "unsupported try/catch: normalization does not converge"))
+            error("normalize_cf! failed to converge (likely a mux bug)")
+        end
     end
+    has_enter(m) && verify_try_structure(m)
     return changed
 end
 

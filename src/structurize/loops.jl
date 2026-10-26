@@ -28,7 +28,8 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
                               region_blocks::Set{Int},
                               loop_ctx::Union{Nothing, LoopCtx}=nothing;
-                              find_merge::Bool=true)
+                              find_merge::Bool=true,
+                              depth::Union{Nothing, Vector{Int}}=nothing)
     nblocks = length(cfg.blocks)
 
     then_blocks = Set{Int}()
@@ -61,7 +62,8 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
     # else`. A unique target is the merge; zero targets means both arms diverge;
     # multiple targets is a multi-entry continuation handled by the multiplexer.
     entries, _ = branch_continuation(cfg, domtree, current, true_dest, false_dest,
-                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+                                     then_blocks, else_blocks, region_blocks, loop_ctx;
+                                     depth)
     merge = length(entries) == 1 ? only(entries) : nothing
 
     return then_blocks, else_blocks, merge
@@ -96,12 +98,18 @@ which the outer multiplexer left out of the inner region. So out-of-region
 targets are kept as entries, but loop boundaries (`loop_ctx`) are dropped: a
 back-edge to the header is a continue and an edge out of the loop is a break,
 neither is part of this branch's forward continuation.
+
+`depth` (the handler-stack depth at each block's entry, see `handler_depths`)
+drops try exits the same way: an edge into a block with fewer handlers than
+`current` leaves a try body that encloses the branch, so it becomes a `LeaveOp`
+in the lift rather than a continuation entry.
 """
 function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
                               then_blocks::Set{Int}, else_blocks::Set{Int},
                               region_blocks::Set{Int},
-                              loop_ctx::Union{Nothing, LoopCtx}=nothing)
+                              loop_ctx::Union{Nothing, LoopCtx}=nothing;
+                              depth::Union{Nothing, Vector{Int}}=nothing)
     nblocks = length(cfg.blocks)
 
     # notContinuation = branch entry ∪ arm regions; continuation = distinct
@@ -130,6 +138,8 @@ function branch_continuation(cfg::CFG, domtree::DomTree, current::Int,
                 continue
             end
             dominates(domtree, succ, b) && continue   # back-edge to enclosing header
+            # try exit (a `LeaveOp` in the lift)
+            depth !== nothing && depth[succ] < depth[current] && continue
             if succ ∉ seen
                 push!(seen, succ)
                 push!(entries, succ)
