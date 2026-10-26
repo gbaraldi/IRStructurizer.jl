@@ -379,6 +379,7 @@ function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{In
     result = LoopPhiInfo[]
     preds = ctx.cfg.blocks[header].preds
     for (k, arg) in enumerate(m.blocks[header].args)
+        # `Some(operand)` once found: an operand can be the constant `nothing`.
         entry_val = nothing
         carried_val = nothing
         for p in preds
@@ -387,13 +388,13 @@ function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{In
             v = ops[k]
             v isa Undef && continue
             if p ∈ loop_blocks
-                carried_val = v
+                carried_val = Some(v)
             else
-                entry_val = v
+                entry_val = Some(v)
             end
         end
         if entry_val !== nothing && carried_val !== nothing
-            push!(result, LoopPhiInfo(arg, entry_val, carried_val))
+            push!(result, LoopPhiInfo(arg, something(entry_val), something(carried_val)))
         elseif entry_val !== nothing || carried_val !== nothing
             has_entry = entry_val !== nothing
             error("internal error: loop header arg %$arg at BB$header has ",

@@ -50,6 +50,21 @@ function counted(n::Int)
 end
 end
 
+# A loop whose back edge carries the constant `nothing`, which inlining `record` leaves.
+module CarryNothing
+const SINK = Int[]
+@inline record(i) = (push!(SINK, i); nothing)
+function carry(n::Int)
+    x::Union{Int, Nothing} = 1
+    i = 0
+    while i < n
+        i += 1
+        x = record(i)
+    end
+    x
+end
+end
+
 @testset "regression suite" begin
 
 #=============================================================================
@@ -604,6 +619,13 @@ end
         return acc
     end
     @test @roundtrip invoke_closure(4)
+end
+
+@testset "a loop carrying the constant nothing" begin
+    sci, _ = code_structured(CarryNothing.carry, Tuple{Int}) |> only
+    for n in (0, 3)
+        @test execute(sci, n) === CarryNothing.carry(n)
+    end
 end
 
 @testset "irreducible CFGs (entry multiplexer)" begin
