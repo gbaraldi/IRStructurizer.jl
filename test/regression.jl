@@ -679,6 +679,72 @@ end
     end
 end
 
+@testset "a loop variable undefined on entry" begin
+    # Lowered loop-header phis leave an undefined init unassigned.
+    phis_ok(sci) = let phis = filter(s -> s isa PhiNode, Core.Compiler.IRCode(sci).stmts.stmt)
+        any(p -> !all(k -> isassigned(p.values, k), eachindex(p.values)), phis) &&
+            !any(p -> any(k -> isassigned(p.values, k) && p.values[k] isa Undef,
+                          eachindex(p.values)), phis)
+    end
+
+    # A variable first assigned inside the loop enters it as `Undef`, whichever loop
+    # op the loop becomes.
+    function undef_entry_loop(n)
+        local z
+        i = 0
+        while true
+            i += 1
+            i > n && return z
+            z = i * 2
+        end
+    end
+    function undef_entry_for(n)
+        local z
+        i = 0
+        while i < n
+            i += 1
+            z = i * 2
+        end
+        z
+    end
+    function undef_entry_while(n)
+        local z
+        i = 1
+        while i * i < n
+            z = i
+            i += 2
+        end
+        z
+    end
+    for (f, Op) in ((undef_entry_loop, LoopOp), (undef_entry_for, ForOp),
+                    (undef_entry_while, WhileOp))
+        sci, _ = code_structured(f, Tuple{Int}) |> only
+        @test count_stmts(sci.entry, s -> s isa Op) == 1
+        for n in (3, 20)
+            @test execute(sci, n) == f(n)
+        end
+        @test_throws UndefVarError execute(sci, 0)
+        @test phis_ok(sci)
+    end
+
+    # An induction variable undefined on entry has no lower bound, so the loop is
+    # not promoted to a ForOp.
+    add(a, b) = Expr(:call, GlobalRef(Core.Intrinsics, :add_int), a, b)
+    sci = StructuredIRCode(build_ir([
+        (stmts=[(GotoNode(2), Any)], succs=[2]),
+        (stmts=[(PhiNode(Int32[3], Any[SSAValue(6)]), Int),                  # %2 i
+                (PhiNode(Int32[1, 3], Any[0, SSAValue(7)]), Int),            # %3
+                (Expr(:call, GlobalRef(Core.Intrinsics, :slt_int), SSAValue(2), Argument(2)), Bool),
+                (GotoIfNot(SSAValue(4), 4), Any)], succs=[4, 3]),
+        (stmts=[(add(SSAValue(2), 1), Int),
+                (add(SSAValue(3), 1), Int),
+                (GotoNode(2), Any)], succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(3)), Any)], succs=Int[]),
+    ], Any[Any, Int]))
+    @test count_stmts(sci.entry, s -> s isa ForOp) == 0
+    @test phis_ok(sci)
+end
+
 @testset "empty counted while-loop returns its init, not its bound" begin
     # A `while x < n` whose induction value starts at or above the bound runs zero
     # times, so the loop result must be the init (the unchanged IV), not the bound.
