@@ -439,6 +439,44 @@ end
     end
 end
 
+@testset "a variable first assigned inside a loop" begin
+    # The entry edge leaves the header argument undefined; it enters the loop as
+    # an `Undef` and is carried from the back edge.
+    function undef_entry_while(n)
+        local z
+        i = 0
+        while i < n
+            i += 1
+            if i > 2
+                z = i
+            end
+            i > 4 && break
+        end
+        z
+    end
+    function undef_entry_return(n)
+        local z
+        i = 0
+        while true
+            i += 1
+            i > n && return z
+            z = i * 2
+        end
+    end
+    for f in (undef_entry_while, undef_entry_return)
+        sci, _ = code_structured(f, Tuple{Int}) |> only
+        for n in (3, 6)
+            @test execute(sci, n) == f(n)
+        end
+        @test_throws UndefVarError execute(sci, 0)
+        # Lowered back, the header phi leaves its entry slot unassigned.
+        phis = filter(s -> s isa PhiNode, Core.Compiler.IRCode(sci).stmts.stmt)
+        @test !isempty(phis)
+        @test !any(p -> any(i -> isassigned(p.values, i) && p.values[i] isa Undef,
+                            eachindex(p.values)), phis)
+    end
+end
+
 @testset "empty counted while-loop returns its init, not its bound" begin
     # A `while x < n` whose induction value starts at or above the bound runs zero
     # times, so the loop result must be the init (the unchanged IV), not the bound.
