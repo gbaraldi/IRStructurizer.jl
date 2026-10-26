@@ -87,13 +87,44 @@ Validation rules:
 - WhileOp before: must have ConditionOp
 - WhileOp after: must have YieldOp
 - LoopOp body: recursively validate nested ops
+- TryOp: body and handler must have explicit terminators; a LeaveOp may only sit
+  inside a TryOp body (through IfOps and inner handlers), never across a loop, and
+  no BreakOp or ContinueOp may exit a body or handler;
+  the body and handler yields and the LeaveOps that exit the body carry the op's
+  results (arity and types); no value return inside the body; every listed upsilon
+  is an UpsilonNode (placement is checked by `validate_ssa_defs`)
 """
 function validate_terminators(sci::StructuredIRCode)
     errors = String[]
-    validate_terminators!(errors, sci, sci.entry)
+    walk = TerminatorWalk()
+    validate_terminators!(errors, sci, sci.entry, walk)
+    isempty(walk.tries) || validate_try_upsilons!(errors, sci, walk.tries)
     isempty(errors) || error("internal error: invalid terminators: ",
                               join(errors, "; "))
     return true
+end
+
+# What the terminator walk carries down: whether the current block sits in a try
+# body, where a LeaveOp may end it (through IfOp arms and inner try handlers; loops
+# and inner try bodies are boundaries); whether it sits in a try body or handler
+# since the innermost loop, where a BreakOp or ContinueOp may not end it; and the
+# TryOps seen so far, whose upsilons are checked afterwards. Code without a TryOp
+# pays no extra walk.
+mutable struct TerminatorWalk
+    in_try::Bool
+    in_try_region::Bool
+    tries::Vector{Pair{Int, TryOp}}
+end
+TerminatorWalk() = TerminatorWalk(false, false, Pair{Int, TryOp}[])
+
+# Walk `b` with the flags set as given, restoring them afterwards.
+function validate_region_terminators!(errors::Vector{String}, sci::StructuredIRCode,
+                                      b::Block, walk::TerminatorWalk, in_try::Bool,
+                                      in_try_region::Bool=in_try)
+    saved = (walk.in_try, walk.in_try_region)
+    walk.in_try, walk.in_try_region = in_try, in_try_region
+    validate_terminators!(errors, sci, b, walk)
+    walk.in_try, walk.in_try_region = saved
 end
 
 # Convenience method for testing: wrap block in minimal SCI
@@ -102,19 +133,150 @@ function validate_terminators(entry::Block)
     return validate_terminators(sci)
 end
 
-function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, block::Block)
+function validate_terminators!(errors::Vector{String}, sci::StructuredIRCode, block::Block,
+                               walk::TerminatorWalk=TerminatorWalk())
+    block.terminator isa LeaveOp && !walk.in_try &&
+        push!(errors, "LeaveOp outside a TryOp body")
+    # A loop exit from a try body would skip leaving it, and the lift routes every
+    # exit of a try, from its handler too, through the op's continuation.
+    block.terminator isa Union{BreakOp, ContinueOp} && walk.in_try_region &&
+        push!(errors, "$(nameof(typeof(block.terminator))) out of a TryOp")
     for (idx, entry) in block.body
         stmt = entry.stmt
         if stmt isa IfOp
-            validate_if_terminators!(errors, sci, stmt, idx, entry.type)
+            validate_if_terminators!(errors, sci, stmt, idx, entry.type, walk)
         elseif stmt isa ForOp
-            validate_for_terminators!(errors, sci, stmt, idx)
+            validate_for_terminators!(errors, sci, stmt, idx, walk)
         elseif stmt isa WhileOp
-            validate_while_terminators!(errors, sci, stmt, idx)
+            validate_while_terminators!(errors, sci, stmt, idx, walk)
         elseif stmt isa LoopOp
-            validate_loop_terminators!(errors, sci, stmt, idx)
+            validate_loop_terminators!(errors, sci, stmt, idx, walk)
+        elseif stmt isa TryOp
+            push!(walk.tries, idx => stmt)
+            validate_try_terminators!(errors, sci, stmt, idx, entry.type, walk)
         end
     end
+end
+
+function validate_try_terminators!(errors::Vector{String}, sci::StructuredIRCode,
+                                   op::TryOp, idx::Int, @nospecialize(result_type),
+                                   walk::TerminatorWalk=TerminatorWalk())
+    for (name, b) in (("body", op.body), ("handler", op.handler))
+        b === nothing && continue
+        b.terminator === nothing &&
+            push!(errors, "TryOp at %$idx: $name must have explicit terminator, got nothing")
+        b.terminator isa ConditionOp &&
+            push!(errors, "TryOp at %$idx: $name cannot end in ConditionOp")
+        # A LeaveOp exits the innermost try body; the handler runs with this try's
+        # handler popped, so it answers to the enclosing body.
+        validate_region_terminators!(errors, sci, b, walk, b === op.body || walk.in_try, true)
+    end
+    if op.handler !== nothing && length(op.upsilons) != length(op.handler.args)
+        push!(errors, "TryOp at %$idx: $(length(op.upsilons)) upsilon lists for $(length(op.handler.args)) handler arguments")
+    end
+
+    # Every exit to the continuation carries the op's results: the yields that end
+    # the body and the handler, and the LeaveOps that exit this body.
+    expected = result_type === Nothing ? () : ifop_expected_yield_types(result_type)
+    if expected !== nothing
+        exits = Pair{String, Block}[]
+        op.body.terminator isa YieldOp && push!(exits, "body yield" => op.body)
+        op.handler !== nothing && op.handler.terminator isa YieldOp &&
+            push!(exits, "handler yield" => op.handler)
+        collect_try_leaves!(exits, op.body)
+        for (what, b) in exits
+            vals = (b.terminator::Union{YieldOp, LeaveOp}).values
+            if length(vals) != length(expected)
+                push!(errors, "TryOp at %$idx: $what carries $(length(vals)) values for result type $result_type")
+                continue
+            end
+            for (i, v) in enumerate(vals)
+                check_yield_type!(errors, b, v, expected[i], idx, i, what; op="TryOp")
+            end
+        end
+    end
+
+    # A value return would leave the body without popping its handler (or scope):
+    # exits from a try go through its continuation.
+    has_value_return(op.body) &&
+        push!(errors, "TryOp at %$idx: a value return inside the body (exits must leave through the continuation)")
+end
+
+# The blocks ending in a LeaveOp that exits `block`'s try body: through IfOp arms and
+# inner TryOp handlers, which run inside this body; loops and inner try bodies are
+# boundaries (as in `TerminatorWalk`).
+function collect_try_leaves!(out::Vector{Pair{String, Block}}, block::Block)
+    block.terminator isa LeaveOp && push!(out, "leave" => block)
+    for (_, entry) in block.body
+        stmt = entry.stmt
+        if stmt isa IfOp
+            foreach(b -> collect_try_leaves!(out, b), blocks(stmt))
+        elseif stmt isa TryOp && stmt.handler !== nothing
+            collect_try_leaves!(out, stmt.handler)
+        end
+    end
+    return out
+end
+
+function has_value_return(block::Block)
+    t = block.terminator
+    t isa ReturnNode && isdefined(t, :val) && return true
+    for (_, entry) in block.body
+        entry.stmt isa ControlFlowOp || continue
+        any(has_value_return, blocks(entry.stmt)) && return true
+    end
+    return false
+end
+
+# Each listed upsilon of a TryOp handler argument names an UpsilonNode statement.
+function validate_try_upsilons!(errors::Vector{String}, sci::StructuredIRCode,
+                                tries::Vector{Pair{Int, TryOp}})
+    wanted = Set{Int}(first(t) for t in tries)
+    for (_, op) in tries, us in op.upsilons
+        union!(wanted, us)
+    end
+    paths = Dict{Int, Vector{Tuple{Block, Int}}}()
+    upsilons = Set{Int}()
+    stmt_paths!(paths, upsilons, wanted, sci.entry, Tuple{Block, Int}[])
+    for (idx, op) in tries, (k, us) in enumerate(op.upsilons), u in us
+        if !(u in upsilons)
+            push!(errors, "TryOp at %$idx: upsilon %$u of handler argument $k is not an UpsilonNode")
+        elseif !runs_before_handler(paths[u], paths[idx], op)
+            push!(errors, "TryOp at %$idx: upsilon %$u of handler argument $k is neither in the body nor before the op")
+        end
+    end
+end
+
+# The nesting path of each statement in `wanted`: its block and position in it at
+# each level, from the entry block down. Also collects which of them are upsilons.
+function stmt_paths!(paths, upsilons::Set{Int}, wanted::Set{Int}, block::Block,
+                     stack::Vector{Tuple{Block, Int}})
+    for (pos, (idx, entry)) in enumerate(block.body)
+        push!(stack, (block, pos))
+        if idx in wanted
+            paths[idx] = copy(stack)
+            entry.stmt isa Core.UpsilonNode && push!(upsilons, idx)
+        end
+        if entry.stmt isa ControlFlowOp
+            for b in blocks(entry.stmt)
+                stmt_paths!(paths, upsilons, wanted, b, stack)
+            end
+        end
+        pop!(stack)
+    end
+end
+
+# An upsilon can feed the handler if it sits in the op's body, or anywhere before the
+# op in program order (lowering resolves the list when it reaches the handler): where
+# the two paths part, the upsilon's branch comes first in the same block.
+function runs_before_handler(pu, pt, op::TryOp)
+    n = length(pt)
+    length(pu) > n && view(pu, 1:n) == pt && return first(pu[n+1]) === op.body
+    for L in 1:min(length(pu), n)
+        pu[L] == pt[L] && continue
+        return first(pu[L]) === first(pt[L]) && last(pu[L]) < last(pt[L])
+    end
+    return false
 end
 
 # Extract the per-position expected types from an IfOp's declared result type.
@@ -133,7 +295,8 @@ function ifop_expected_yield_types(@nospecialize(result_type))
 end
 
 function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
-                                   op::IfOp, idx::Int, @nospecialize(result_type))
+                                   op::IfOp, idx::Int, @nospecialize(result_type),
+                                   walk::TerminatorWalk=TerminatorWalk())
     then_term = op.then_region.terminator
     else_term = op.else_region.terminator
 
@@ -182,8 +345,8 @@ function validate_if_terminators!(errors::Vector{String}, sci::StructuredIRCode,
         end
     end
 
-    validate_terminators!(errors, sci, op.then_region)
-    validate_terminators!(errors, sci, op.else_region)
+    validate_terminators!(errors, sci, op.then_region, walk)
+    validate_terminators!(errors, sci, op.else_region, walk)
 end
 
 # Check a single yield value against the IfOp's declared per-position type.
@@ -193,25 +356,28 @@ end
 # parent chain and resolves SSAs defined in the surrounding scope.
 function check_yield_type!(errors::Vector{String}, block::Block,
                             @nospecialize(value), @nospecialize(expected),
-                            idx::Int, pos::Int, branch::String)
+                            idx::Int, pos::Int, branch::String; op::String="IfOp")
     value isa Undef && return
     ty = value_type(block, value)
     ty === nothing && return
     if !(ty <: expected)
-        push!(errors, "IfOp at %$idx: $branch yield at position $pos has type $ty, not <: declared $expected")
+        what = op == "IfOp" ? "$branch yield" : branch
+        push!(errors, "$op at %$idx: $what at position $pos has type $ty, not <: declared $expected")
     end
 end
 
-function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::ForOp, idx::Int)
+function validate_for_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::ForOp, idx::Int,
+                                   walk::TerminatorWalk=TerminatorWalk())
     term = op.body.terminator
     if !(term isa ContinueOp)
         push!(errors, "ForOp at %$idx: body must have ContinueOp, got $(typeof(term))")
     end
 
-    validate_terminators!(errors, sci, op.body)
+    validate_region_terminators!(errors, sci, op.body, walk, false)
 end
 
-function validate_while_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::WhileOp, idx::Int)
+function validate_while_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::WhileOp, idx::Int,
+                                     walk::TerminatorWalk=TerminatorWalk())
     before_term = op.before.terminator
     after_term = op.after.terminator
 
@@ -222,11 +388,12 @@ function validate_while_terminators!(errors::Vector{String}, sci::StructuredIRCo
         push!(errors, "WhileOp at %$idx: after region must have YieldOp, got $(typeof(after_term))")
     end
 
-    validate_terminators!(errors, sci, op.before)
-    validate_terminators!(errors, sci, op.after)
+    validate_region_terminators!(errors, sci, op.before, walk, false)
+    validate_region_terminators!(errors, sci, op.after, walk, false)
 end
 
-function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::LoopOp, idx::Int)
+function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCode, op::LoopOp, idx::Int,
+                                    walk::TerminatorWalk=TerminatorWalk())
     n_init = length(op.init_values)
     n_args = length(op.body.args)
 
@@ -245,7 +412,7 @@ function validate_loop_terminators!(errors::Vector{String}, sci::StructuredIRCod
         end
     end
 
-    validate_terminators!(errors, sci, op.body)
+    validate_region_terminators!(errors, sci, op.body, walk, false)
 end
 
 #=============================================================================
@@ -320,6 +487,19 @@ function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}
     end
 end
 
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, node::Core.UpsilonNode)
+    isdefined(node, :val) && check_use!(scope_stack, violations, node.val)
+end
+
+function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, op::TryOp)
+    has_scope(op) && check_use!(scope_stack, violations, op.scope)
+    for b in blocks(op)
+        push!(scope_stack, Set{Int}())
+        validate_ssa_defs_scoped!(scope_stack, violations, b)
+        pop!(scope_stack)
+    end
+end
+
 function check_stmt_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, node::GotoIfNot)
     node.cond isa SSAValue && check_use!(scope_stack, violations, node.cond)
 end
@@ -387,7 +567,7 @@ function check_terminator_uses!(::Vector{Set{Int}}, ::Vector{Int}, term)
     # nothing terminator or unrecognized: no uses.
 end
 
-function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::Union{YieldOp, ContinueOp, BreakOp})
+function check_terminator_uses!(scope_stack::Vector{Set{Int}}, violations::Vector{Int}, term::Union{YieldOp, ContinueOp, BreakOp, LeaveOp})
     for v in term.values
         check_use!(scope_stack, violations, v)
     end
