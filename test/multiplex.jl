@@ -27,6 +27,60 @@ end
 # Lift a (manually muxed) MCFG to an SCI and execute it (build_ir comes from setup.jl).
 mux_exec(m, args...) = exec_ir(CCx.IRCode(lift_mcfg(m)), args...)
 
+# Shapes that need several normalization rounds: short-circuit continuations, a loop
+# with several exits, values defined in a loop and used after it.
+function norm_gates(n::Int, k::Int)
+    s = 0
+    for i in 1:n
+        if (i % 2 == 0 || i < k) && (i % 3 != 0 || k < 0)
+            s += i
+        elseif i == k
+            s -= 2
+        end
+    end
+    return s
+end
+function norm_exits(n::Int, k::Int)
+    s = 0; i = 0
+    while i < n
+        i += 1
+        i == k && continue
+        i > 2k && k > 0 && break
+        for j in 1:k
+            j == i && continue
+            j + i > 20 && return s
+            s += i - j
+        end
+    end
+    return s
+end
+function norm_escapes(n::Int, k::Int)
+    a = 0; b = 1; c = 0
+    i = 0
+    while i < n
+        i += 1
+        a = i * k
+        b = b + a
+        i == k && break
+        c = a - b
+        b > 1000 && break
+        a < -50 && return a + c
+    end
+    return a + 2b + 3c
+end
+
+# `normalize_cf!` without shared analyses: every pass computes its own CFG, dominator
+# tree and loops, and the continuation scan starts at the first block every round.
+function normalize_unshared!(m)
+    guard = 0
+    limit = 8 * (length(m.blocks) + 16)      # as normalize_cf!: from the blocks before muxing
+    while IRStructurizer.normalize_one_irreducible!(m) || IRStructurizer.normalize_one_loop_latch!(m) ||
+          IRStructurizer.normalize_one_continuation!(m) || IRStructurizer.normalize_one_preheader!(m)
+        (guard += 1) > limit && error("did not converge")
+    end
+    return m
+end
+
 @testset "multiplex (mutate-then-lift)" begin
 
 @testset "EdgeMultiplexer" begin
@@ -75,6 +129,22 @@ mux_exec(m, args...) = exec_ir(CCx.IRCode(lift_mcfg(m)), args...)
         mux = single_entry_mux!(m, [EdgeRef(3, :goto), EdgeRef(4, :goto), EdgeRef(5, :goto)])
         @test mux.entries == [6, 7, 8]
         @test [mux_exec(m, p, q) for (p, q) in cases] == [10, 30, 20, 20]
+    end
+end
+
+@testset "normalize_cf! computes its analyses once per round" begin
+    # The same normalized CFG as with every pass computing its own analyses, and code
+    # that runs the same.
+    for f in (norm_gates, norm_exits, norm_escapes)
+        ir = first(only(code_ircode(f, Tuple{Int, Int})))
+        reference = normalize_unshared!(ingest(ir))
+        m = ingest(ir)
+        IRStructurizer.normalize_cf!(m)
+        @test repr(m) == repr(reference)
+        sci = lift_mcfg(m; promote=false)
+        for n in (0, 1, 7, 20), k in (-1, 0, 2, 6, 10)
+            @test exec_ir(CCx.IRCode(sci), n, k) == f(n, k)
+        end
     end
 end
 
