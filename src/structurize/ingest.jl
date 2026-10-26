@@ -115,6 +115,7 @@ function ingest(ir::IRCode; exceptions::Symbol=:error)
     if has_eh
         hoist_pops_over_leaves!(m)
         split_leaves!(m)
+        sink_pops_below_leaves!(m)
     end
     fold_undef_args!(m)
     return m
