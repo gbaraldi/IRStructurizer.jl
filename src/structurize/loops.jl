@@ -358,37 +358,43 @@ struct LoopPhiInfo
     carried_val::Any
 end
 
-"""Extract a loop header's block arguments, separating each into its entry value
-(operand on an edge from outside the loop) and carried value (operand on the back
-edge from inside the loop). The single-exiting latch and entry mux guarantee one
-of each, so an argument with only one side is malformed (a dead edge the optimizer
-left, or unexpected loop structure); error rather than emit wrong carries."""
+"""Extract a loop header's block arguments, pairing each with its entry value (the
+operand on the edge from outside the loop) and its carried value (the operand on the
+back edge). `normalize_cf` leaves exactly one of each edge: the pre-header and the
+single-exiting latch. An argument undefined on one edge only is malformed (a dead
+edge the optimizer left, or unexpected loop structure); error rather than emit wrong
+carries."""
 function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     m = ctx.m::MCFG
     result = LoopPhiInfo[]
-    preds = ctx.cfg.blocks[header].preds
-    for (k, arg) in enumerate(m.blocks[header].args)
-        entry_val = nothing
-        carried_val = nothing
-        for p in preds
-            ops = edge_operands(m, p, header)
-            ops === nothing && continue
-            v = ops[k]
-            v isa Undef && continue
-            if p ∈ loop_blocks
-                carried_val = v
-            else
-                entry_val = v
-            end
+    args = m.blocks[header].args
+    # Also skips a loop headed by the function's entry block, which has no entry edge.
+    isempty(args) && return result
+    entry_ops = carried_ops = nothing
+    for p in ctx.cfg.blocks[header].preds
+        ops = edge_operands(m, p, header)
+        ops === nothing && error("internal error: BB$p is a predecessor of loop header ",
+                                 "BB$header but has no edge to it")
+        if p ∈ loop_blocks
+            carried_ops === nothing ||
+                error("internal error: loop header BB$header has several back edges")
+            carried_ops = ops
+        else
+            entry_ops === nothing ||
+                error("internal error: loop header BB$header has several entry edges")
+            entry_ops = ops
         end
-        if entry_val !== nothing && carried_val !== nothing
-            push!(result, LoopPhiInfo(arg, entry_val, carried_val))
-        elseif entry_val !== nothing || carried_val !== nothing
-            has_entry = entry_val !== nothing
-            error("internal error: loop header arg %$arg at BB$header has ",
-                  has_entry ? "entry" : "carried", " value but no ",
-                  has_entry ? "carried" : "entry", " value")
+    end
+    (entry_ops === nothing || carried_ops === nothing) &&
+        error("internal error: loop header BB$header lacks an entry or a back edge")
+    for (k, arg) in enumerate(args)
+        entry, carried = entry_ops[k], carried_ops[k]
+        entry isa Undef && carried isa Undef && continue
+        if entry isa Undef || carried isa Undef
+            error("internal error: loop header arg %$arg at BB$header is undefined on its ",
+                  entry isa Undef ? "entry" : "back", " edge only")
         end
+        push!(result, LoopPhiInfo(arg, entry, carried))
     end
     result
 end
