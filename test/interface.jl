@@ -80,11 +80,37 @@ end
     end
 end
 
+@testset "validation: loop carry types checked against the carries" begin
+    function mk_loop_sci(init, cont, argtypes)
+        body = Block()
+        push!(body.args, BlockArgument(1, Int))
+        body.terminator = ContinueOp(Any[cont])
+        entry = Block()
+        push!(entry, 1, LoopOp(body, Any[init]), Tuple{Int})
+        entry.terminator = ReturnNode(nothing)
+        return StructuredIRCode(argtypes, Any[], entry, 10)
+    end
+    @test validate_terminators(mk_loop_sci(Core.Argument(2), BlockArgument(1, Int), Any[Any, Int]))
+    sci = mk_loop_sci(Core.Argument(2), BlockArgument(1, Int), Any[Any, Any])
+    @test_throws "LoopOp at %1: init value at position 1 has type Any" validate_terminators(sci)
+    sci = mk_loop_sci(Core.Argument(2), Core.Argument(3), Any[Any, Int, Any])
+    @test_throws "LoopOp at %1: ContinueOp value at position 1 has type Any" validate_terminators(sci)
+
+    body = Block()
+    push!(body.args, BlockArgument(2, Int))
+    body.terminator = ContinueOp(Any[BlockArgument(2, Int)])
+    entry = Block()
+    push!(entry, 1, ForOp(0, 0, 1, BlockArgument(1, Int), body, Any[7]), Tuple{String})
+    entry.terminator = ReturnNode(nothing)
+    sci = StructuredIRCode(Any[Any], Any[], entry, 10)
+    @test_throws "ForOp at %1: carry at position 1 has type Int64, not <: declared String" validate_terminators(sci)
+end
+
 @testset "validation: IfOp yield types checked against declared result" begin
-    # Mirror Julia's own phi-node verifier: each yield must be <: the IfOp's
-    # declared per-position result type. Yields in the two branches do *not*
-    # need to be related to each other — Julia IR routinely merges disjoint
-    # types at phi nodes (the declared phi type is the join, not either edge).
+    # Each yield must be <: the IfOp's declared per-position result type. Yields
+    # in the two branches do *not* need to be related to each other — Julia IR
+    # routinely merges disjoint types at phi nodes (the declared phi type is the
+    # join, not either edge).
 
     # Helper: build a minimal SCI with an IfOp yielding one value per branch.
     function mk_if_sci(arg_then, arg_else, argtypes, result_type)

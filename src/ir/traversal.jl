@@ -11,14 +11,21 @@ ContinueOp/BreakOp target the enclosing loop, while YieldOp targets the
 nearest enclosing result-producing op. Because IfOp captures YieldOp, only
 ContinueOp/BreakOp are visible through nested IfOps.
 """
-function reachable_terminators(outer::Block)
-    result = Terminator[]
+reachable_terminators(outer::Block) = Terminator[last(p) for p in reachable_exits(outer)]
+
+"""
+    reachable_exits(block::Block) -> Vector{Pair{Block, Terminator}}
+
+[`reachable_terminators`](@ref), each paired with the block it terminates.
+"""
+function reachable_exits(outer::Block)
+    result = Pair{Block, Terminator}[]
 
     # Outer terminator. Include yield/condition here because outer may be an IfOp.
     let
         term = outer.terminator
         if term isa ContinueOp || term isa BreakOp || term isa YieldOp || term isa ConditionOp
-            push!(result, term)
+            push!(result, outer => term)
         end
     end
 
@@ -27,7 +34,7 @@ function reachable_terminators(outer::Block)
     function collect_terminators!(inner::Block)
         term = inner.terminator
         if term isa ContinueOp || term isa BreakOp
-            push!(result, term)
+            push!(result, inner => term)
         end
         for (_, entry) in inner.body
             if entry.stmt isa IfOp

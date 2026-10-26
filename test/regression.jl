@@ -207,6 +207,89 @@ end
     end
 end
 
+@testset "an edge operand wider than its phi is narrowed" begin
+    # Julia types a phi by what inference knows on each edge: `x::Any` reaching it
+    # from behind `x isa Int` feeds an `Int` phi. The structurizer narrows such an
+    # operand with a PiNode in the region that takes the edge; without it the
+    # validator rejects the op's operand.
+    function narrow_decl(x)
+        x::Int = x
+        x + 1
+    end
+    sci, _ = code_structured(narrow_decl, Tuple{Any}) |> only   # validates
+    for x in (1, 7)
+        @test execute(sci, x) == narrow_decl(x)
+    end
+    @test_throws MethodError execute(sci, "a")
+    # The same refinement after an inlined `iterate` (a `Union{Nothing, Tuple}` value
+    # feeding a `Tuple` phi), before the optimizer has removed it.
+    function narrow_iter(n)
+        a = Tuple{Int,Int}[]
+        for i in 1:n
+            for j in 3:4
+                push!(a, (i, j))
+                j == 6 && break
+            end
+        end
+        a
+    end
+    ir, _ = only(code_ircode(narrow_iter, Tuple{Int}; optimize_until=3))
+    sci = StructuredIRCode(ir)                                    # validates
+    @test execute(sci, 3) == narrow_iter(3)
+    # A single-predecessor phi narrower than its operand (%4 of %1): the walk binds
+    # it with a PiNode rather than renaming it to the wider %1.
+    ir = build_ir([
+        (stmts=[(Expr(:call, GlobalRef(Base, :identity), Argument(2)), Any),
+                (Expr(:call, GlobalRef(Core, :isa), SSAValue(1), Int), Bool),
+                (GotoIfNot(SSAValue(2), 3), Any)],                     succs=[2, 3]),
+        (stmts=[(PhiNode(Int32[1], Any[SSAValue(1)]), Int),
+                (GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(GotoNode(4), Any)],                                   succs=[4]),
+        (stmts=[(PhiNode(Int32[2, 3], Any[SSAValue(4), 0]), Int),
+                (ReturnNode(SSAValue(7)), Any)],                       succs=Int[]),
+    ], Any[Any, Any])
+    sci = StructuredIRCode(ir)                                    # validates
+    @test any(b -> any(((_, e),) -> e.stmt isa PiNode, b.body), IRStructurizer.eachblock(sci))
+    @test execute(sci, 5) === 5
+    @test execute(sci, "a") === 0
+    # A loop init (%4 of %1, entered only if `%1 isa Int`).
+    ir = build_ir([
+        (stmts=[(Expr(:call, GlobalRef(Base, :identity), Argument(2)), Any),
+                (Expr(:call, GlobalRef(Core, :isa), SSAValue(1), Int), Bool),
+                (GotoIfNot(SSAValue(2), 4), Any)],                     succs=[2, 4]),
+        (stmts=[(PhiNode(Int32[1, 3], Any[SSAValue(1), SSAValue(7)]), Int),
+                (Expr(:call, GlobalRef(Base, :slt_int), SSAValue(4), 3), Bool),
+                (GotoIfNot(SSAValue(5), 4), Any)],                     succs=[3, 4]),
+        (stmts=[(Expr(:call, GlobalRef(Base, :add_int), SSAValue(4), 1), Int),
+                (GotoNode(2), Any)],                                   succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 2], Any[0, SSAValue(4)]), Int),
+                (ReturnNode(SSAValue(9)), Any)],                       succs=Int[]),
+    ], Any[Any, Any])
+    sci = StructuredIRCode(ir)                                    # validates
+    @test execute(sci, 1) === 3
+    @test execute(sci, 5) === 5
+    @test execute(sci, "a") === 0
+    # A loop carry (%3 of %1, which repeats only if `%1 isa Int`).
+    ir = build_ir([
+        (stmts=[(Expr(:call, GlobalRef(Base, :identity), Argument(2)), Any),
+                (GotoNode(2), Any)],                                   succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 3], Any[0, SSAValue(1)]), Int),
+                (PhiNode(Int32[1, 3], Any[0, SSAValue(9)]), Int),
+                (Expr(:call, GlobalRef(Core, :isa), SSAValue(1), Int), Bool),
+                (Expr(:call, GlobalRef(Base, :slt_int), SSAValue(4), 3), Bool),
+                (Expr(:call, GlobalRef(Base, :and_int), SSAValue(5), SSAValue(6)), Bool),
+                (GotoIfNot(SSAValue(7), 4), Any)],                     succs=[3, 4]),
+        (stmts=[(Expr(:call, GlobalRef(Base, :add_int), SSAValue(4), 1), Int),
+                (GotoNode(2), Any)],                                   succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(3)), Any)],                       succs=Int[]),
+    ], Any[Any, Any])
+    for promote in (false, true)
+        sci = StructuredIRCode(ir; promote)                       # validates
+        @test execute(sci, 5) === 5
+        @test execute(sci, "a") === 0
+    end
+end
+
 if isdefined(Core, :getglobal_partition)
 @testset "phi operand is a binding partition" begin
     # Julia 1.14 replaces the `GlobalRef` above with the binding partition the
