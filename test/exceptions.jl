@@ -527,6 +527,26 @@ function eh_split_join_ir(inner_first::Bool)
     return build_ir(blocks, Any[Tuple{}, Bool])
 end
 
+# A try B in catch A whose two arms each pop A's exception and then share one
+# `leave B`, with a handler that rethrows. The leave is shared, so the pops stay
+# inside B, one handler deeper than catch A, where `%A` is still in scope.
+function eh_shared_leave_ir()
+    blocks = [
+        (stmts=[(Core.EnterNode(3), Any)], succs=[3, 2]),
+        (stmts=[(Expr(:call, Core.throw, ErrorException("a")), Union{}), (ReturnNode(), Union{})],
+         succs=Int[]),
+        (stmts=[(Core.EnterNode(9), Any)], succs=[9, 4]),
+        (stmts=[(GotoIfNot(Core.Argument(2), 6), Any)], succs=[5, 6]),
+        (stmts=[(Expr(:call, eh_log, 1), Nothing), (Expr(:pop_exception, SSAValue(1)), Nothing),
+                (GotoNode(7), Any)], succs=[7]),
+        (stmts=[(Expr(:call, eh_log, 2), Nothing), (Expr(:pop_exception, SSAValue(1)), Nothing)],
+         succs=[7]),
+        (stmts=[(Expr(:leave, SSAValue(4)), Any)], succs=[8]),
+        (stmts=[(ReturnNode(Core.Argument(2)), Any)], succs=Int[]),
+        (stmts=[(Expr(:call, rethrow), Union{}), (ReturnNode(), Union{})], succs=Int[]),
+    ]
+    return build_ir(blocks, Any[Tuple{}, Bool])
+end
 function eh_try_after_returning_try(x)
     try
         eh_log(10)
@@ -910,6 +930,48 @@ end
         @test any(((s, t),) -> t === Union{} &&
                   (s isa Core.PhiCNode || s isa PhiNode || s isa Core.UpsilonNode),
                   zip(ir.stmts.stmt, ir.stmts.type))
+    end
+end
+
+@testset "normalize_cf! gives every try a single continuation" begin
+    # Afterwards the edges out of a try's body and handler reach one block, which
+    # is not a loop header, and a loop that contains a try contains all of it.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        IRStructurizer.normalize_cf!(m)
+        loops = IRStructurizer.natural_loops_m(m)
+        for r in values(try_info(m))
+            targets = unique(edge_of(m, ref).target for ref in try_exit_refs(m, r))
+            @test length(targets) <= 1
+            @test !any(in(keys(loops)), targets)
+            for body in values(loops)
+                r.block in body && @test issubset(IRStructurizer.construct_blocks(r), body)
+            end
+        end
+    end
+    # A catch block also reached by ordinary control flow (after a leave) is not
+    # something Julia's lowering produces, and is rejected.
+    ir = build_ir([
+        (stmts=[(Core.EnterNode(3), Any)],                       succs=[3, 2]),
+        (stmts=[(Expr(:leave, SSAValue(1)), Any), (GotoNode(3), Any)], succs=[3]),
+        (stmts=[(ReturnNode(1), Any)],                           succs=Int[]),
+    ], Any[Any, Int])
+    @test_throws UnstructuredControlFlowError IRStructurizer.normalize_cf!(
+        ingest(ir; exceptions=:structured))
+    # A pop that stays one handler deeper than its catch, before a shared leave, is
+    # still in scope there and is accepted.
+    @test IRStructurizer.normalize_cf!(ingest(eh_shared_leave_ir(); exceptions=:structured)) isa Bool
+    # A pop_exception that a rewrite left outside its catch is not: in its own try
+    # body, or before the enter, which does not dominate it.
+    @testset "pop moved to the $where" for where in (:body, :entry)
+        m = eh_mcfg(eh_basic)
+        from = findfirst(b -> any(st -> is_pop_exception(st.stmt), b.body), m.blocks)
+        pop = only(filter(st -> is_pop_exception(st.stmt), m.blocks[from].body))
+        filter!(st -> st !== pop, m.blocks[from].body)
+        enter = findfirst(b -> b.term isa MEnter, m.blocks)
+        to = where === :body ? m.blocks[enter].term.body.target : m.entry
+        push!(m.blocks[to].body, pop)
+        @test_throws UnstructuredControlFlowError IRStructurizer.normalize_cf!(m)
     end
 end
 
