@@ -235,6 +235,21 @@ function print_expr(p::IRPrinter, v)
     print_value(p, v)
 end
 
+function print_expr(p::IRPrinter, v::Core.UpsilonNode)
+    print(p.io, "ϒ (")
+    isdefined(v, :val) ? print_value(p, v.val) : print(p.io, "#undef")
+    print(p.io, ")")
+end
+
+function print_expr(p::IRPrinter, v::Core.PhiCNode)
+    print(p.io, "φᶜ (")
+    for (i, a) in enumerate(v.values)
+        i > 1 && print(p.io, ", ")
+        print_value(p, a)
+    end
+    print(p.io, ")")
+end
+
 # Print initial values (carries) with their types.
 function print_init_values(p::IRPrinter, carry_args::Vector{BlockArgument}, init_values::Vector{IRValue})
     if isempty(carry_args)
@@ -273,7 +288,7 @@ function print_terminator(p::IRPrinter, term::ReturnNode; is_last_in_block::Bool
     println(p.io)
 end
 
-function print_terminator(p::IRPrinter, term::Union{YieldOp,ContinueOp,BreakOp,ConditionOp}; is_last_in_block::Bool=false)
+function print_terminator(p::IRPrinter, term::Union{YieldOp,ContinueOp,BreakOp,ConditionOp,LeaveOp}; is_last_in_block::Bool=false)
     if is_last_in_block && endswith(p.line_prefix, "│   ")
         closing_prefix = chop(p.line_prefix; tail=4)
         print_colored(p, closing_prefix, :light_black)
@@ -370,6 +385,10 @@ function print_terminator_content(p::IRPrinter, term::BreakOp)
     print_colored(p, "break", :yellow)
     print_terminator_values(p, term.values)
 end
+function print_terminator_content(p::IRPrinter, term::LeaveOp)
+    print_colored(p, "leave", :yellow)
+    print_terminator_values(p, term.values)
+end
 function print_terminator_content(p::IRPrinter, term::ConditionOp)
     print_colored(p, "condition", :yellow)
     print(p.io, "(")
@@ -400,6 +419,55 @@ print_control_flow(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(result_type);
 print_control_flow(p::IRPrinter, op::ForOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_for_op_final(p, op, pos, result_type; is_last)
 print_control_flow(p::IRPrinter, op::WhileOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_while_op_final(p, op, pos, result_type; is_last)
 print_control_flow(p::IRPrinter, op::LoopOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_loop_op_final(p, op, pos, result_type; is_last)
+print_control_flow(p::IRPrinter, op::TryOp, pos::Int, @nospecialize(result_type); is_last::Bool=false) = print_try_op_final(p, op, pos, result_type; is_last)
+
+function print_try_op_final(p::IRPrinter, op::TryOp, pos::Int, @nospecialize(result_type); is_last::Bool=false)
+    # The try header (no box-drawing prefix for the op itself).
+    print_indent(p)
+    idx_s = string(pos)
+    pad = " "^(p.max_idx_width - length(idx_s) - 4)
+    print(p.io, "%", idx_s, pad, " = ")
+    print_colored(p, "try", :yellow)
+    if has_scope(op)
+        print(p.io, " scope ")
+        print_value(p, op.scope)
+    end
+    if result_type !== nothing
+        print_colored(p, " -> ", :light_black)
+        print_colored(p, string(result_type), :cyan)
+    end
+    println(p.io)
+
+    # "body:" region, then the handler ("catch", with the upsilons feeding each
+    # argument). A scope-only try has no handler: its body closes the op.
+    no_handler = op.handler === nothing
+    print_region_header(p, "body", op.body.args; is_last=false)
+    body_p = child_printer(p, op.body, "│   ")
+    print_block_body(body_p, op.body; is_last_in_parent=no_handler)
+    no_handler && return
+
+    handler = op.handler::Block
+    print_indent(p)
+    print_colored(p, "├", :light_black)
+    print(p.io, " catch")
+    if !isempty(handler.args)
+        print(p.io, "(")
+        for (i, arg) in enumerate(handler.args)
+            i > 1 && print(p.io, ", ")
+            print(p.io, "%arg", arg.id)
+            print_colored(p, string("::", format_type(arg.type)), :cyan)
+            if i <= length(op.upsilons)
+                print(p.io, " ← ϒ[")
+                join(p.io, ("%$u" for u in op.upsilons[i]), ", ")
+                print(p.io, "]")
+            end
+        end
+        print(p.io, ")")
+    end
+    println(p.io, ":")
+    handler_p = child_printer(p, handler, "│   ")
+    print_block_body(handler_p, handler; is_last_in_parent=true)
+end
 
 function print_if_op_final(p::IRPrinter, op::IfOp, pos::Int, @nospecialize(result_type); is_last::Bool=false)
     # The if header (no box-drawing prefix for the op itself).
