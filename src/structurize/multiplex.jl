@@ -82,8 +82,9 @@ entry_index(mux::EdgeMux, e::Int) = findfirst(==(e), mux.entries)::Int - 1   # 0
 # Values the dispatch forwards to entry `e`. Empty under `absorb`, since the entry
 # has no args and its body reads the mux's carries directly. `live` is the set of
 # mux arg positions that some redirected edge assigned a real (non-`Undef`) value;
-# a position absent from `live` is forwarded as `Undef`, since its mux phi would be
-# empty (e.g. a value only the body defines, never the skipped continuation entry).
+# a position absent from `live` is forwarded as `Undef` directly rather than as its
+# all-undef mux arg (e.g. a value only the body defines, never the skipped
+# continuation entry).
 function slice_vals(mux::EdgeMux, e::Int, live::Union{Nothing, Set{Int}})
     mux.absorb && return Any[]
     off = mux.offset[e]
@@ -211,8 +212,8 @@ function dispatch!(m::MCFG, mux::EdgeMux; excluded::Set{Int}=Set{Int}(),
 end
 
 # Mux arg positions that some incoming (redirected) edge assigned a real value.
-# A position never assigned is dead: its phi would be empty, so the dispatch
-# forwards `Undef` for it instead of referencing the empty phi.
+# A position never assigned is undefined on every edge, so the dispatch forwards
+# `Undef` for it instead of a reference to that mux arg.
 function _live_positions(m::MCFG, mux::EdgeMux, refs::Vector{EdgeRef})
     live = Set{Int}()
     for r in refs

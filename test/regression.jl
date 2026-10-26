@@ -188,6 +188,110 @@ end
     @test execute(sci, false, 0.5) === 1.0
 end
 
+@testset "block argument with no incoming value" begin
+    # Optimized IR can keep a phi with no incoming values (`φ()`), e.g. a union-split
+    # result that only the other member's path computes, as long as a later phi or
+    # a statement still names it. Its block argument is `Undef` on every edge but is
+    # still a value its uses refer to.
+    mul = GlobalRef(Core.Intrinsics, :mul_float)
+    add = GlobalRef(Core.Intrinsics, :add_int)
+    slt = GlobalRef(Core.Intrinsics, :slt_int)
+    ifelse = GlobalRef(Core, :ifelse)
+
+    # Read by a later phi, on an edge whose value is never used.
+    #  1: goto 5 if not c      2: goto 4 if not d      3: goto 4
+    #  4: %4 = φ()                                      goto 6
+    #  5: %6 = x * x                                    goto 6
+    #  6: %8 = φ(4 => %4, 5 => %6); %9 = φ(4 => false, 5 => true); return ifelse(%9, %8, 1.0)
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 5), Any)],                      succs=[5, 2]),
+        (stmts=[(GotoIfNot(Argument(3), 4), Any)],                      succs=[4, 3]),
+        (stmts=[(GotoNode(4), Any)],                                    succs=[4]),
+        (stmts=[(PhiNode(Int32[], Any[]), Float64), (GotoNode(6), Any)], succs=[6]),
+        (stmts=[(Expr(:call, mul, Argument(4), Argument(4)), Float64),
+                (GotoNode(6), Any)],                                    succs=[6]),
+        (stmts=[(PhiNode(Int32[4, 5], Any[SSAValue(4), SSAValue(6)]), Float64),
+                (PhiNode(Int32[4, 5], Any[false, true]), Bool),
+                (Expr(:call, ifelse, SSAValue(9), SSAValue(8), 1.0), Float64),
+                (ReturnNode(SSAValue(10)), Any)],                       succs=Int[]),
+    ], Any[Any, Bool, Bool, Float64])
+    sci = StructuredIRCode(ir)
+    for c in (true, false), d in (true, false)
+        @test execute(sci, c, d, 0.75) === (c ? 1.0 : 0.75 * 0.75)
+    end
+
+    # The same through a chain of phis.
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 6), Any)],                      succs=[6, 2]),
+        (stmts=[(GotoIfNot(Argument(3), 4), Any)],                      succs=[4, 3]),
+        (stmts=[(GotoNode(4), Any)],                                    succs=[4]),
+        (stmts=[(PhiNode(Int32[], Any[]), Float64), (GotoNode(5), Any)], succs=[5]),
+        (stmts=[(PhiNode(Int32[4], Any[SSAValue(4)]), Float64),
+                (GotoNode(7), Any)],                                    succs=[7]),
+        (stmts=[(Expr(:call, mul, Argument(4), Argument(4)), Float64),
+                (GotoNode(7), Any)],                                    succs=[7]),
+        (stmts=[(PhiNode(Int32[5, 6], Any[SSAValue(6), SSAValue(8)]), Float64),
+                (PhiNode(Int32[5, 6], Any[false, true]), Bool),
+                (Expr(:call, ifelse, SSAValue(11), SSAValue(10), 1.0), Float64),
+                (ReturnNode(SSAValue(12)), Any)],                       succs=Int[]),
+    ], Any[Any, Bool, Bool, Float64])
+    sci = StructuredIRCode(ir)
+    for c in (true, false), d in (true, false)
+        @test execute(sci, c, d, 0.75) === (c ? 1.0 : 0.75 * 0.75)
+    end
+
+    # Read by a statement at a branch merge.
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 3), Any)],                      succs=[3, 2]),
+        (stmts=[(GotoNode(3), Any)],                                    succs=[3]),
+        (stmts=[(PhiNode(Int32[], Any[]), Float64),
+                (Expr(:call, ifelse, true, Argument(3), SSAValue(3)), Float64),
+                (ReturnNode(SSAValue(4)), Any)],                        succs=Int[]),
+    ], Any[Any, Bool, Float64])
+    sci = StructuredIRCode(ir)
+    @test execute(sci, true, 0.75) === 0.75
+    @test execute(sci, false, 0.75) === 0.75
+
+    # At a loop header, read by a statement in the body. `%2` has no value on
+    # either edge, `%3` none on entry.
+    #  1: goto 2
+    #  2: %2 = φ(); %3 = φ(4 => %6); %4 = φ(1 => 0, 4 => %6)
+    #     %5 = ifelse(true, x, %2)                   goto 3
+    #  3: %6 = %4 + 1; %7 = %6 < 3                   goto 5 if not %7
+    #  4: goto 2
+    #  5: return (%5, ifelse(true, 7, %3))
+    ir = build_ir([
+        (stmts=[(GotoNode(2), Any)],                                    succs=[2]),
+        (stmts=[(PhiNode(Int32[], Any[]), Float64),
+                (PhiNode(Int32[4], Any[SSAValue(6)]), Int),
+                (PhiNode(Int32[1, 4], Any[0, SSAValue(6)]), Int),
+                (Expr(:call, ifelse, true, Argument(2), SSAValue(2)), Float64)], succs=[3]),
+        (stmts=[(Expr(:call, add, SSAValue(4), 1), Int),
+                (Expr(:call, slt, SSAValue(6), 3), Bool),
+                (GotoIfNot(SSAValue(7), 5), Any)],                      succs=[4, 5]),
+        (stmts=[(GotoNode(2), Any)],                                    succs=[2]),
+        (stmts=[(Expr(:call, ifelse, true, 7, SSAValue(3)), Int),
+                (Expr(:call, Core.tuple, SSAValue(5), SSAValue(10)), Tuple{Float64, Int}),
+                (ReturnNode(SSAValue(11)), Any)],                       succs=Int[]),
+    ], Any[Any, Float64])
+    sci = StructuredIRCode(ir)
+    @test execute(sci, 0.75) === (0.75, 7)
+end
+
+@testset "loop carry of a literal `nothing`" begin
+    ir = build_ir([
+        (stmts=[(GotoNode(2), Any)],                                    succs=[2]),
+        (stmts=[(PhiNode(Int32[1, 4], Any[nothing, nothing]), Nothing),
+                (PhiNode(Int32[1, 4], Any[0, SSAValue(4)]), Int)],      succs=[3]),
+        (stmts=[(Expr(:call, GlobalRef(Core.Intrinsics, :add_int), SSAValue(3), 1), Int),
+                (Expr(:call, GlobalRef(Core.Intrinsics, :slt_int), SSAValue(4), 3), Bool),
+                (GotoIfNot(SSAValue(5), 5), Any)],                      succs=[4, 5]),
+        (stmts=[(GotoNode(2), Any)],                                    succs=[2]),
+        (stmts=[(ReturnNode(SSAValue(2)), Any)],                        succs=Int[]),
+    ], Any[Any])
+    @test execute(StructuredIRCode(ir)) === nothing
+end
+
 @testset "phi operand is a GlobalRef" begin
     # A merge can carry a `GlobalRef` to a const binding as an operand (Base's
     # math kernels yield `Inf` that way). Typing the operand as the GlobalRef
