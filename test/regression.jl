@@ -656,6 +656,26 @@ end
     @test s1 == s2
 end
 
+@testset "unreachable blocks are not irreducible" begin
+    # `CFGReachability.irreducible` is allocated uninitialized and only written for
+    # reachable blocks. Set the bits of the unreachable cycle (blocks 2 and 3) as
+    # leftover memory could.
+    ir = build_ir([
+        (stmts=[(GotoNode(4), Any)],     succs=[4]),
+        (stmts=[(GotoNode(3), Any)],     succs=[3]),
+        (stmts=[(GotoNode(2), Any)],     succs=[2]),
+        (stmts=[(ReturnNode(1), Any)],   succs=Int[]),
+    ], Any[Any])
+    m = IRStructurizer.ingest(ir)
+    cfg = IRStructurizer.build_cfg(m)
+    reach = Core.Compiler.CFGReachability(cfg, Core.Compiler.construct_domtree(cfg))
+    for bb in (2, 3)
+        Core.Compiler.setindex!(reach.irreducible, true, bb)   # Compiler's own BitArray on 1.11
+    end
+    @test isempty(IRStructurizer.irreducible_sccs(reach, length(m.blocks)))
+    @test !IRStructurizer.normalize_one_irreducible!(m)
+end
+
 @testset "nested gated bodies (continuation multiplexer)" begin
     # The canonical case the continuation multiplexer fixes. A `||`-guarded body
     # whose body is ITSELF a `||`-guarded body, inside a loop carrying an
