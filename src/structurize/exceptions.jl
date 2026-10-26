@@ -9,6 +9,17 @@
  `EnterNode` into an `MEnter` terminator and gives every `:leave` a block of its
  own that pops one handler (`split_leaves!`). `handler_stacks` is the forward
  dataflow over those pushes and pops: the handlers active at each block's entry.
+
+ A try is then three sets of blocks (`try_info`):
+
+     B ── MEnter ──body──▶ R   blocks entered with the handler active
+                 └─catch─▶ C   blocks the catch block dominates that run on B's
+                               own handler stack before the catch's
+                               `pop_exception`, minus the `:leave` blocks that pop
+                               one of B's outer handlers
+
+ Every edge out of R starts at a `:leave` block, and every edge out of R ∪ C lands
+ on a block with B's handler stack.
 =============================================================================#
 
 is_leave(@nospecialize(s)) = s isa Expr && s.head === :leave
@@ -120,4 +131,153 @@ function split_leaves!(m::MCFG)
         m.blocks[prev].term_codeloc = term_codeloc
         m.blocks[prev].term_id = term_id
     end
+end
+
+#=============================================================================
+ Try regions
+=============================================================================#
+
+"""
+    TryRegion
+
+One try, by its `MEnter`. `enter` is the `MEnter` id (the `TryOp`'s SSA index) and
+`block` the block it terminates. `body` (R) holds the blocks entered with this
+handler active. `handler` (C) holds the blocks the catch block dominates that run
+on `block`'s handler stack, minus the `:leave` blocks that pop one of the outer
+handlers. It is empty for a scope-only enter. `depth` is the handler-stack depth
+at `block`'s entry.
+"""
+struct TryRegion
+    enter::Int
+    block::Int
+    body::Set{Int}
+    handler::Set{Int}
+    depth::Int
+end
+
+construct_blocks(r::TryRegion) = union(r.body, r.handler)
+
+# A block holding only a `:leave` that pops one of the handlers in `outer`. It
+# belongs to the enclosing try body, not to the handler region that reaches it.
+function is_outer_leave(b::MBlock, outer::Vector{Int})
+    length(b.body) == 1 || return false
+    st = b.body[1].stmt
+    is_leave(st) || return false
+    return any(a -> a isa SSAValue && a.id in outer, st.args)
+end
+
+"""
+    try_info(m, stacks=handler_stacks(m), domtree=...) -> Dict{Int, TryRegion}
+
+The `TryRegion` of every reachable `MEnter`, keyed by the `MEnter` id.
+
+A handler region ends where its exception is popped. When the protected body
+cannot complete normally (it always throws, or loops forever), the catch block
+dominates all the code after the handler, so dominance alone would pull that code
+in, and with it every continuation `normalize_one_try!` builds. So a block is in the
+handler only if it is entered with the exception state of this catch, or of a catch
+nested in it (`exception_states`), not the state `pop_exception` restores, or if it
+lies inside a try entered within the catch. An exit out of such a try pops the
+catch's exception before it leaves the try (`break` out of `catch; try ... end`),
+and the leave block that follows is still part of the handler.
+"""
+function try_info(m::MCFG, stacks=handler_stacks(m),
+                  domtree::DomTree=construct_domtree(build_cfg(m)))
+    regions = Dict{Int, TryRegion}()
+    enter_block = Dict{Int, Int}(b.term.id => bid for (bid, b) in enumerate(m.blocks)
+                                 if b.term isa MEnter && stacks[bid] !== nothing)
+    estate, at_enter = exception_states(m, enter_block)
+    for (bid, b) in enumerate(m.blocks)
+        t = b.term
+        t isa MEnter || continue
+        σ = stacks[bid]
+        σ === nothing && continue
+        body = Set{Int}()
+        handler = Set{Int}()
+        for (x, s) in enumerate(stacks)
+            s === nothing && continue
+            t.id in s && push!(body, x)
+        end
+        if t.catch_dest != 0
+            c = t.catch_dest
+            d = length(σ)
+            for (x, s) in enumerate(stacks)
+                s === nothing && continue
+                (length(s) >= d && view(s, 1:d) == σ) || continue
+                dominates(domtree, c, x) || continue
+                # Code inside a try entered within this catch stays in the handler
+                # even past the catch's pop: Julia may pop before leaving that try.
+                (in_catch(estate[x], t.id, at_enter) ||
+                 (length(s) > d && in_catch(get(at_enter, s[d+1], -1), t.id, at_enter))) || continue
+                is_outer_leave(m.blocks[x], σ) && continue
+                push!(handler, x)
+            end
+        end
+        regions[t.id] = TryRegion(t.id, bid, body, handler, length(σ))
+    end
+    return regions
+end
+
+"""Whether exception state `s` lies inside the catch of the enter `e`: it is `e`'s own
+state, or that of a catch nested in it (whose enter ran in state `e`)."""
+function in_catch(s::Int, e::Int, at_enter::Dict{Int, Int})
+    for _ in 0:length(at_enter)       # the states form a tree; bound the walk anyway
+        s == e && return true
+        s <= 0 && return false
+        s = get(at_enter, s, 0)
+    end
+    return false
+end
+
+"""The edges that leave a try's body and handler (R ∪ C). Each lands on a block that
+holds the try block's handler stack; together they are the `TryOp`'s continuation."""
+function try_exit_refs(m::MCFG, r::TryRegion)
+    construct = construct_blocks(r)
+    refs = EdgeRef[]
+    for src in sort!(collect(construct))
+        for ref in _edge_refs_of(src, m.blocks[src].term)
+            edge_of(m, ref).target in construct || push!(refs, ref)
+        end
+    end
+    return refs
+end
+
+is_pop_exception(@nospecialize(s)) =
+    s isa Expr && s.head === :pop_exception && length(s.args) == 1 && s.args[1] isa SSAValue
+
+"""
+    exception_states(m, enter_block) -> (state at each block's entry, state at each enter)
+
+The exception-stack state, as in the second component of Julia's
+`compute_trycatch`: the id of the `MEnter` whose catch region the code is in (0
+outside every catch). The catch edge of an `MEnter` sets it to that enter's id, and
+`pop_exception %X` restores the state that `X` was entered with.
+"""
+function exception_states(m::MCFG, enter_block::Dict{Int, Int})
+    nb = length(m.blocks)
+    state = fill(-1, nb)          # -1: not reached yet
+    at_enter = Dict{Int, Int}()
+    state[m.entry] = 0
+    work = Int[m.entry]
+    while !isempty(work)
+        b = pop!(work)
+        s = state[b]
+        blk = m.blocks[b]
+        for st in blk.body
+            is_pop_exception(st.stmt) || continue
+            x = st.stmt.args[1].id
+            haskey(enter_block, x) || continue
+            s = get(at_enter, x, s)
+        end
+        t = blk.term
+        t isa MEnter && (at_enter[t.id] = s)
+        for tgt in _term_targets(t)
+            s′ = (t isa MEnter && tgt == t.catch_dest && tgt != t.body.target) ? t.id : s
+            if state[tgt] == -1
+                state[tgt] = s′
+                push!(work, tgt)
+            end
+        end
+    end
+    return state, at_enter
 end
