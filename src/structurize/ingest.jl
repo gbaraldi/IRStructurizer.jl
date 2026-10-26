@@ -84,9 +84,70 @@ function ingest(ir::IRCode)
     end
 
     valid_worlds = @static VERSION >= v"1.12-" ? ir.valid_worlds : nothing
-    return MCFG(blocks, 1, types, codelocs,
-                length(ir.stmts.stmt) + 1,
-                copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
+    m = MCFG(blocks, 1, types, codelocs,
+             length(ir.stmts.stmt) + 1,
+             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
+    fold_undef_args!(m)
+    return m
+end
+
+"""Fold the block arguments that every incoming edge leaves undefined and that only feed
+other block arguments. Julia keeps a phi with no incoming values (defined on no path
+into its block, e.g. a union-split result that only the other member's path computes)
+when a later phi still names it on an edge whose value is never read. Such an argument
+has no value to carry, so it leaves its block and edges, and the edge operands that
+name it become `Undef` of its type. That can leave a later argument undefined on every
+edge too, so the folding propagates along the operands. An argument a statement,
+branch or return reads stays."""
+function fold_undef_args!(m::MCFG)
+    incoming = [MEdge[] for _ in m.blocks]
+    for b in m.blocks
+        t = b.term
+        edges = t isa MGoto ? (t.edge,) : t isa MCondBr ? (t.t, t.f) : ()
+        for e in edges
+            push!(incoming[e.target], e)
+        end
+    end
+    # How many incoming edges give each argument a value; the arguments with none.
+    defined = [[count(e -> !(e.args[k] isa Undef), incoming[bid]) for k in eachindex(b.args)]
+               for (bid, b) in enumerate(m.blocks)]
+    work = Tuple{Int, Int}[(bid, k) for bid in eachindex(m.blocks)
+                           if !isempty(incoming[bid]) for k in findall(iszero, defined[bid])]
+    isempty(work) && return
+    stmt_uses = Set{Int}()
+    note(@nospecialize(v)) = (v isa SSAValue && push!(stmt_uses, v.id); v)
+    for b in m.blocks
+        for st in b.body
+            remap_ssa(st.stmt, note)
+        end
+        t = b.term
+        t isa MCondBr && note(t.cond)
+        t isa MReturn && t.has_val && note(t.val)
+    end
+    operand_at = Dict{Int, Vector{Tuple{MEdge, Int}}}()   # value id => where it's an edge operand
+    for es in incoming, e in es, (j, v) in enumerate(e.args)
+        v isa SSAValue && push!(get!(Vector{Tuple{MEdge, Int}}, operand_at, v.id), (e, j))
+    end
+    folded = [falses(length(b.args)) for b in m.blocks]
+    while !isempty(work)
+        bid, k = pop!(work)
+        arg = m.blocks[bid].args[k]
+        (folded[bid][k] || arg in stmt_uses) && continue
+        folded[bid][k] = true
+        T = get(m.types, arg, Any)
+        for (e, j) in get(operand_at, arg, ())
+            e.args[j] = Undef(T)
+            (defined[e.target][j] -= 1) == 0 && push!(work, (e.target, j))
+        end
+    end
+    for (bid, b) in enumerate(m.blocks)
+        dead = findall(folded[bid])
+        isempty(dead) && continue
+        deleteat!(b.args, dead)
+        for e in incoming[bid]
+            deleteat!(e.args, dead)
+        end
+    end
 end
 
 function _ingest_term(term_stmt, i::Int, bb, nb::Int)
