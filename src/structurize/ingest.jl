@@ -23,7 +23,8 @@ end
 
 Convert dense `IRCode` into the explicit-edge mutable form. Leading phi nodes of
 each block become block arguments; the values they carry per predecessor become
-that predecessor edge's operands. Stable ids == original SSA positions.
+that predecessor edge's operands. Stable ids == original SSA positions. Blocks
+unreachable from the entry are dropped (see `prune_unreachable!`).
 """
 function ingest(ir::IRCode)
     di = @static VERSION >= v"1.12-" ? ir.debuginfo : ir.linetable
@@ -84,9 +85,38 @@ function ingest(ir::IRCode)
     end
 
     valid_worlds = @static VERSION >= v"1.12-" ? ir.valid_worlds : nothing
-    return MCFG(blocks, 1, types, codelocs,
-                length(ir.stmts.stmt) + 1,
-                copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
+    m = MCFG(blocks, 1, types, codelocs,
+             length(ir.stmts.stmt) + 1,
+             copy(ir.argtypes), copy(ir.sptypes), di, valid_worlds)
+    return prune_unreachable!(m)
+end
+
+_term_edges(t::MGoto) = (t.edge,)
+_term_edges(t::MCondBr) = (t.t, t.f)
+_term_edges(t::MReturn) = ()
+
+"""Drop the blocks unreachable from the entry, which unoptimized IR can contain,
+and renumber the rest in order. Normalization and the lift would otherwise count
+the edges out of them as predecessors, and Compiler's `CFGReachability` leaves
+their `irreducible` bits uninitialized. A phi operand for a dead predecessor
+lives on that predecessor's edge, so it goes with the block."""
+function prune_unreachable!(m::MCFG)
+    live = falses(length(m.blocks))
+    worklist = [m.entry]
+    while !isempty(worklist)
+        b = pop!(worklist)
+        live[b] && continue
+        live[b] = true
+        append!(worklist, _term_targets(m.blocks[b].term))
+    end
+    all(live) && return m
+    newid = cumsum(live)
+    keepat!(m.blocks, live)
+    for b in m.blocks, e in _term_edges(b.term)
+        e.target = newid[e.target]
+    end
+    m.entry = newid[m.entry]
+    return m
 end
 
 function _ingest_term(term_stmt, i::Int, bb, nb::Int)

@@ -56,8 +56,9 @@ end
 MBlock(args, body, term, term_codeloc) = MBlock(args, body, term, term_codeloc, 0)
 MBlock() = MBlock(Int[], MStmt[], MReturn(), (Int32(0), Int32(0), Int32(0)))
 
-"""The whole mutable CFG. Blocks are indexed by id == position in `blocks`; the
-vector only ever grows (mux/trampoline blocks appended), so ids are stable.
+"""The whole mutable CFG. Blocks are indexed by id == position in `blocks`, and
+every block is reachable from `entry`. After `ingest` (which drops unreachable
+blocks) the vector only grows (mux/trampoline blocks appended), so ids are stable.
 `types`/`codelocs` cover block-argument and synthesized ids; body-statement
 types/codelocs live in the `MStmt`s."""
 mutable struct MCFG
