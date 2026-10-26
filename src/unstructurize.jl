@@ -1,7 +1,8 @@
 # Convert StructuredIRCode back to flat IRCode.
 #
-# Lowers nested control flow ops (IfOp, ForOp, WhileOp, LoopOp) back to
-# GotoNode/GotoIfNot/PhiNode/ReturnNode for execution via OpaqueClosure.
+# Lowers nested control flow ops (IfOp, ForOp, WhileOp, LoopOp, TryOp) back to
+# GotoNode/GotoIfNot/PhiNode/ReturnNode (and EnterNode/:leave/PhiCNode) for
+# execution via OpaqueClosure.
 
 
 #=============================================================================
@@ -22,6 +23,12 @@ struct LoopTarget
     break_gotos::Vector{Tuple{Int, Int}}    # (bb, stmt_pos) of GotoNode(-1) placeholders
 end
 
+struct TryTarget
+    enter_ssa::Int                          # sparse SSA of the EnterNode
+    merge_phis::Vector{PhiNode}             # the TryOp's results
+    exit_gotos::Vector{Tuple{Int, Int}}     # (bb, stmt_pos) of GotoNode(-1) placeholders
+end
+
 mutable struct UnstructurizeCtx
     bbs::Vector{FlatBB}
     next_ssa::Int
@@ -29,13 +36,14 @@ mutable struct UnstructurizeCtx
     arg_rename::Dict{Int, Int}               # BlockArgument.id → sparse SSA of phi
     cfop_results::Dict{Int, Vector{Int}}     # cfop old SSA → result phi sparse SSAs
     loop_stack::Vector{LoopTarget}
+    try_stack::Vector{TryTarget}             # enclosing TryOp bodies (innermost last)
     # maps sparse SSA → debug-info anchor (same semantics as StructurizeCtx.line_map)
     line_map::Dict{Int, Int}
 end
 
 function UnstructurizeCtx(line_map::Dict{Int, Int}=Dict{Int, Int}())
     UnstructurizeCtx(FlatBB[], 0, Dict{Int,Int}(), Dict{Int,Int}(),
-                     Dict{Int,Vector{Int}}(), LoopTarget[],
+                     Dict{Int,Vector{Int}}(), LoopTarget[], TryTarget[],
                      line_map)
 end
 
@@ -87,6 +95,9 @@ function resolve_stmt(ctx::UnstructurizeCtx, @nospecialize(stmt))
     elseif stmt isa ReturnNode
         isdefined(stmt, :val) || return stmt
         return ReturnNode(resolve_value(ctx, stmt.val))
+    elseif stmt isa Core.UpsilonNode
+        isdefined(stmt, :val) || return stmt
+        return Core.UpsilonNode(resolve_value(ctx, stmt.val))
     elseif stmt isa SSAValue || stmt isa BlockArgument
         return resolve_value(ctx, stmt)
     else
@@ -163,6 +174,8 @@ function lower_block_body!(ctx::UnstructurizeCtx, bb::Int, block::Block)
             bb = lower_whileop!(ctx, bb, idx, stmt, typ)
         elseif stmt isa LoopOp
             bb = lower_loopop!(ctx, bb, idx, stmt, typ)
+        elseif stmt isa TryOp
+            bb = lower_tryop!(ctx, bb, idx, stmt, typ)
         elseif is_cfop_getfield(ctx, stmt)
             cfop_old = stmt.args[2].id
             field_idx = stmt.args[3]::Int
@@ -218,19 +231,14 @@ function lower_ifop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
     else_yields = else_term isa YieldOp
 
     if then_yields || else_yields
-        # at least one branch yields, so a merge block is needed
+        # At least one branch yields, so a merge block is needed. Lower the other
+        # branch's exit first: a LeaveOp adds blocks, and the merge must stay the
+        # last block, where the code after the IfOp falls through.
+        then_yields || lower_diverging_terminator!(ctx, then_last, then_term)
+        else_yields || lower_diverging_terminator!(ctx, else_last, else_term)
         merge_bb = new_bb!(ctx)
-
-        if then_yields
-            emit!(ctx, then_last, GotoNode(merge_bb), Any)
-        else
-            lower_diverging_terminator!(ctx, then_last, then_term)
-        end
-        if else_yields
-            emit!(ctx, else_last, GotoNode(merge_bb), Any)
-        else
-            lower_diverging_terminator!(ctx, else_last, else_term)
-        end
+        then_yields && emit!(ctx, then_last, GotoNode(merge_bb), Any)
+        else_yields && emit!(ctx, else_last, GotoNode(merge_bb), Any)
 
         # build the merge PhiNodes
         phi_ssas = Int[]
@@ -294,6 +302,8 @@ function lower_diverging_terminator!(ctx::UnstructurizeCtx, bb::Int,
         handle_continue!(ctx, bb, term)
     elseif term isa BreakOp
         handle_break!(ctx, bb, term)
+    elseif term isa LeaveOp
+        handle_leave!(ctx, bb, term.values)
     elseif term === nothing
         # unreachable block, nothing to emit
     else
@@ -338,6 +348,99 @@ function handle_break!(ctx::UnstructurizeCtx, bb::Int, term::BreakOp)
     pos = length(ctx.bbs[bb].stmts) + 1
     emit!(ctx, bb, GotoNode(-1), Any)
     push!(lt.break_gotos, (bb, pos))
+end
+
+#=============================================================================
+ TryOp Lowering
+=============================================================================#
+
+"""Lower a `TryOp`: an `EnterNode` ending `bb`, the body falling through from it,
+the handler as the catch block (its arguments become `PhiCNode`s over the
+upsilons), and a merge block whose phis are the op's results. Every exit from the
+body pops the handler with an explicit `:leave` (`handle_leave!`)."""
+function lower_tryop!(ctx::UnstructurizeCtx, bb::Int, cfop_idx::Int,
+                      op::TryOp, @nospecialize(cfop_typ))
+    scope = has_scope(op) ? resolve_value(ctx, op.scope) : nothing
+
+    # EnterNode placeholder ending `bb`, patched once the catch block exists.
+    # `pop_exception` statements name the TryOp, i.e. this enter.
+    enter_ssa = emit!(ctx, bb, nothing, Any)
+    enter_pos = length(ctx.bbs[bb].stmts)
+    ctx.ssa_rename[cfop_idx] = enter_ssa
+    anchor_sparse_line!(ctx, enter_ssa, cfop_idx)
+
+    n_results = cfop_typ isa DataType && cfop_typ <: Tuple ? length(cfop_typ.parameters) : 0
+    result_types = extract_tuple_types(cfop_typ, n_results)
+    tt = TryTarget(enter_ssa, PhiNode[PhiNode(Int32[], Any[]) for _ in 1:n_results],
+                   Tuple{Int,Int}[])
+
+    # body_bb is next in sequence: the enter's fallthrough
+    body_bb = new_bb!(ctx)
+    push!(ctx.try_stack, tt)
+    body_last = lower_block_body!(ctx, body_bb, op.body)
+    body_term = op.body.terminator
+    if body_term isa Union{YieldOp, LeaveOp}
+        handle_leave!(ctx, body_last, body_term.values)
+    else
+        lower_diverging_terminator!(ctx, body_last, body_term)
+    end
+    pop!(ctx.try_stack)
+
+    catch_bb = 0
+    if op.handler !== nothing
+        catch_bb = new_bb!(ctx)
+        for (k, arg) in enumerate(op.handler.args)
+            vals = Any[resolve_value(ctx, SSAValue(u)) for u in op.upsilons[k]]
+            ctx.arg_rename[arg.id] = emit!(ctx, catch_bb, Core.PhiCNode(vals), arg.type)
+        end
+        handler_last = lower_block_body!(ctx, catch_bb, op.handler)
+        handler_term = op.handler.terminator
+        if handler_term isa YieldOp
+            # The handler already runs with the handler popped: no :leave.
+            goto_try_merge!(ctx, handler_last, tt, handler_term.values)
+        else
+            lower_diverging_terminator!(ctx, handler_last, handler_term)
+        end
+    end
+    old = ctx.bbs[bb].stmts[enter_pos]
+    enter = has_scope(op) ? Core.EnterNode(catch_bb, scope) : Core.EnterNode(catch_bb)
+    ctx.bbs[bb].stmts[enter_pos] = (old[1], enter, old[3])
+
+    merge_bb = new_bb!(ctx)
+    phi_ssas = Int[]
+    for (i, phi) in enumerate(tt.merge_phis)
+        ssa = emit!(ctx, merge_bb, phi, result_types[i])
+        anchor_sparse_line!(ctx, ssa, cfop_idx)
+        push!(phi_ssas, ssa)
+    end
+    for (b, pos) in tt.exit_gotos
+        old = ctx.bbs[b].stmts[pos]
+        ctx.bbs[b].stmts[pos] = (old[1], GotoNode(merge_bb), old[3])
+    end
+    ctx.cfop_results[cfop_idx] = phi_ssas
+    return merge_bb
+end
+
+"""Leave the innermost enclosing TryOp body from `bb` with `values` as its results.
+Julia ends a block at each `:leave`, so `bb` jumps to a fresh block holding only
+the leave, which falls through into the jump to the merge (filled in by
+`lower_tryop!`)."""
+function handle_leave!(ctx::UnstructurizeCtx, bb::Int, values::Vector{IRValue})
+    @assert !isempty(ctx.try_stack) "LeaveOp outside a TryOp body"
+    tt = ctx.try_stack[end]
+    leave_bb = new_bb!(ctx)
+    emit!(ctx, bb, GotoNode(leave_bb), Any)
+    emit!(ctx, leave_bb, Expr(:leave, SSAValue(tt.enter_ssa)), Any)
+    goto_try_merge!(ctx, new_bb!(ctx), tt, values)
+end
+
+function goto_try_merge!(ctx::UnstructurizeCtx, bb::Int, tt::TryTarget,
+                         values::Vector{IRValue})
+    for (i, phi) in enumerate(tt.merge_phis)
+        push_phi_value!(phi, bb, resolve_value(ctx, values[i]))
+    end
+    emit!(ctx, bb, GotoNode(-1), Any)
+    push!(tt.exit_gotos, (bb, length(ctx.bbs[bb].stmts)))
 end
 
 #=============================================================================
@@ -650,6 +753,14 @@ function build_dense_ircode(all_stmts, all_types, all_flags, line, bb_ranges;
             i < nb && _cfg_edge!(bb_blocks, i, i + 1)
         elseif last_s isa ReturnNode
             # no successors
+        elseif last_s isa Core.EnterNode
+            # As `compute_basic_blocks`: the catch block gets the exceptional edge
+            # plus a virtual edge from outside the function (pred 0).
+            if last_s.catch_dest != 0
+                _cfg_edge!(bb_blocks, i, last_s.catch_dest)
+                push!(bb_blocks[last_s.catch_dest].preds, 0)
+            end
+            i < nb && _cfg_edge!(bb_blocks, i, i + 1)
         else
             i < nb && _cfg_edge!(bb_blocks, i, i + 1)
         end
