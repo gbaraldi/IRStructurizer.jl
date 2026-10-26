@@ -169,6 +169,25 @@ end
     end
 end
 
+@testset "single-predecessor phi with no value" begin
+    # The copy of an undefined operand is an `Undef` statement, which has to lower
+    # back to an empty phi rather than to the `Undef` object.
+    ir = build_ir([
+        (stmts=[(GotoIfNot(Argument(2), 3), Any)],                       succs=[2, 3]),
+        (stmts=[(PhiNode(Int32[], Any[]), Float64),
+                (Expr(:call, GlobalRef(Core, :ifelse), true, Argument(3), SSAValue(2)), Float64),
+                (ReturnNode(SSAValue(3)), Any)],                         succs=Int[]),
+        (stmts=[(ReturnNode(1.0), Any)],                                 succs=Int[]),
+    ], Any[Any, Bool, Float64])
+    sci = StructuredIRCode(ir)
+    ir2 = CC.IRCode(sci)
+    CC.verify_ir(ir2)
+    @test !any(s -> s isa Undef, ir2.stmts.stmt)
+    @test any(s -> s isa PhiNode && isempty(s.edges), ir2.stmts.stmt)
+    @test execute(sci, true, 0.5) === 0.5
+    @test execute(sci, false, 0.5) === 1.0
+end
+
 @testset "phi operand is a GlobalRef" begin
     # A merge can carry a `GlobalRef` to a const binding as an operand (Base's
     # math kernels yield `Inf` that way). Typing the operand as the GlobalRef
