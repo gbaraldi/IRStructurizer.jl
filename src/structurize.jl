@@ -54,6 +54,8 @@ alloc_arg!(ctx::StructurizeCtx) = (id = ctx.next_arg; ctx.next_arg += 1; id)
 
 """Map a synthesized SSA index to the same source location as an existing SSA index."""
 function anchor_line!(ctx::StructurizeCtx, new_ssa::Int, source_ssa::Int)
+    # A self-anchor would make `resolve_line` follow the entry forever.
+    new_ssa == source_ssa && return
     haskey(ctx.line_map, source_ssa) || return
     ctx.line_map[new_ssa] = source_ssa  # positive anchor: follow to resolve
 end
