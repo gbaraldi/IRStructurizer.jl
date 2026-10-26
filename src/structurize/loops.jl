@@ -28,6 +28,27 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
                               true_dest::Int, false_dest::Int,
                               region_blocks::Set{Int},
                               loop_ctx::Union{Nothing, LoopCtx}=nothing)
+    then_blocks, else_blocks = branch_arms(cfg, domtree, true_dest, false_dest, region_blocks)
+
+    # Continuation by exclusion (MLIR `transformToStructuredCFBranches`): the
+    # merge is the single distinct target of the edges leaving `current ∪ then ∪
+    # else`. A unique target is the merge; zero targets means both arms diverge;
+    # multiple targets is a multi-entry continuation handled by the multiplexer.
+    entries, _ = branch_continuation(cfg, domtree, current, true_dest, false_dest,
+                                     then_blocks, else_blocks, region_blocks, loop_ctx)
+    merge = length(entries) == 1 ? only(entries) : nothing
+
+    return then_blocks, else_blocks, merge
+end
+
+"""
+    branch_arms(cfg, domtree, true_dest, false_dest, region_blocks) -> (then_blocks, else_blocks)
+
+The arm regions of a conditional branch: the blocks of `region_blocks` that each
+successor dominates, if that successor is single-entry (see `find_branch_regions`).
+"""
+function branch_arms(cfg::CFG, domtree::DomTree, true_dest::Int, false_dest::Int,
+                     region_blocks::Set{Int})
     nblocks = length(cfg.blocks)
 
     then_blocks = Set{Int}()
@@ -51,15 +72,7 @@ function find_branch_regions(cfg::CFG, domtree::DomTree, current::Int,
     # (a block should only be in one region)
     setdiff!(then_blocks, else_blocks)
 
-    # Continuation by exclusion (MLIR `transformToStructuredCFBranches`): the
-    # merge is the single distinct target of the edges leaving `current ∪ then ∪
-    # else`. A unique target is the merge; zero targets means both arms diverge;
-    # multiple targets is a multi-entry continuation handled by the multiplexer.
-    entries, _ = branch_continuation(cfg, domtree, current, true_dest, false_dest,
-                                     then_blocks, else_blocks, region_blocks, loop_ctx)
-    merge = length(entries) == 1 ? only(entries) : nothing
-
-    return then_blocks, else_blocks, merge
+    return then_blocks, else_blocks
 end
 
 """

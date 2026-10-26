@@ -26,7 +26,7 @@ end
 function StructurizeCtx(m, line_map::Dict{Int, Int}=Dict{Int, Int}())
     cfg = build_cfg(m)
     domtree = construct_domtree(cfg)
-    loops = natural_loops_m(m)
+    loops = natural_loops_m(m, cfg, domtree)
     # `ctx.types` feeds structural positions (op result / block-arg / Undef types),
     # which must be concrete `Type`s. Widen so a lattice element (e.g. `Core.Const`
     # on a single-literal-edge arg) can't land there. Block-arg and synthesized
