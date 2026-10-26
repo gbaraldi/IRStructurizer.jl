@@ -378,7 +378,9 @@ end
 (operand on an edge from outside the loop) and carried value (operand on the back
 edge from inside the loop). The single-exiting latch and entry mux guarantee one
 of each, so an argument with only one side is malformed (a dead edge the optimizer
-left, or unexpected loop structure); error rather than emit wrong carries."""
+left, or unexpected loop structure); error rather than emit wrong carries. The
+exception is a variable first assigned inside the loop: the entry edge leaves it
+undefined, so it enters as a typed `Undef`."""
 function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{Int})
     m = ctx.m::MCFG
     result = LoopPhiInfo[]
@@ -387,16 +389,23 @@ function extract_loop_phis(ctx::StructurizeCtx, header::Int, loop_blocks::Set{In
         # `Some(operand)` once found: an operand can be the constant `nothing`.
         entry_val = nothing
         carried_val = nothing
+        undef_entry = false
         for p in preds
             ops = edge_operands(m, p, header)
             ops === nothing && continue
             v = ops[k]
-            v isa Undef && continue
+            if v isa Undef
+                p ∈ loop_blocks || (undef_entry = true)
+                continue
+            end
             if p ∈ loop_blocks
                 carried_val = Some(v)
             else
                 entry_val = Some(v)
             end
+        end
+        if entry_val === nothing && carried_val !== nothing && undef_entry
+            entry_val = Some(Undef(get(ctx.types, arg, Any)))
         end
         if entry_val !== nothing && carried_val !== nothing
             push!(result, LoopPhiInfo(arg, something(entry_val), something(carried_val)))
