@@ -482,6 +482,29 @@ function eh_exits_from_catch_in_nested_loops(x)
     end
     x
 end
+# A catch returns out of a try nested in another catch, itself in a try body: the
+# return leaves two trys and pops two catches' exceptions at once.
+function eh_return_across_catches_and_trys(x)
+    try
+        try
+            eh_log(10)
+            x > 5 && eh_throw(ErrorException("a"))
+        catch
+            try
+                try
+                    eh_throw(ErrorException("b"))
+                catch
+                    eh_log(0)
+                    return x
+                end
+            catch
+                rethrow()
+            end
+        end
+    catch
+    end
+    -x
+end
 function eh_try_after_returning_try(x)
     try
         eh_log(10)
@@ -520,6 +543,7 @@ const EH_CASES = [
     (eh_return_from_finally, (1, 7, 12, 20)),
     (eh_return_or_break_from_try_in_catch, (-5, 0, 9)),
     (eh_exits_from_catch_in_nested_loops, (-5, 0, 3, 6, 8)),
+    (eh_return_across_catches_and_trys, (1, 7)),
 ]
 
 @testset "exceptions" begin
@@ -629,6 +653,27 @@ end
     # handler depth of its catch.
     @testset "$(nameof(f))" for (f, _) in EH_CASES
         @test all(((d, at),) -> at == d, eh_pop_depths(eh_mcfg(f)))
+    end
+end
+
+@testset "a pop that leaves several catches is split, one per catch" begin
+    # A `break` from a catch nested in another catch pops straight to the outer
+    # state. Split, every pop runs in the exception state of the catch it pops.
+    @testset "$(nameof(f))" for (f, _) in EH_CASES
+        m = eh_mcfg(f)
+        enter_block = Dict(b.term.id => bid for (bid, b) in enumerate(m.blocks)
+                           if b.term isa MEnter)
+        state, at_enter = IRStructurizer.exception_states(m, enter_block)
+        for (bid, b) in enumerate(m.blocks)
+            state[bid] < 0 && continue
+            s = state[bid]
+            for st in b.body
+                is_pop_exception(st.stmt) || continue
+                x = st.stmt.args[1].id
+                @test s == x
+                s = at_enter[x]
+            end
+        end
     end
 end
 
