@@ -192,7 +192,9 @@ handler only if it is entered with the exception state of this catch, or of a ca
 nested in it (`exception_states`), not the state `pop_exception` restores, or if it
 lies inside a try entered within the catch. An exit out of such a try pops the
 catch's exception before it leaves the try (`break` out of `catch; try ... end`),
-and the leave block that follows is still part of the handler.
+and the leave block that follows is still part of the handler. So is an empty block
+that only forwards one edge of a handler branch to that branch's other target
+(`is_handler_forward`): it runs after the pop, but it belongs with its branch.
 """
 function try_info(m::MCFG, stacks=handler_stacks(m),
                   domtree::DomTree=construct_domtree(build_cfg(m)))
@@ -200,6 +202,10 @@ function try_info(m::MCFG, stacks=handler_stacks(m),
     enter_block = Dict{Int, Int}(b.term.id => bid for (bid, b) in enumerate(m.blocks)
                                  if b.term isa MEnter && stacks[bid] !== nothing)
     estate, at_enter = exception_states(m, enter_block)
+    preds = [Int[] for _ in m.blocks]   # one entry per edge
+    for (bid, b) in enumerate(m.blocks), tgt in _term_targets(b.term)
+        push!(preds[tgt], bid)
+    end
     for (bid, b) in enumerate(m.blocks)
         t = b.term
         t isa MEnter || continue
@@ -225,10 +231,29 @@ function try_info(m::MCFG, stacks=handler_stacks(m),
                 is_outer_leave(m.blocks[x], σ) && continue
                 push!(handler, x)
             end
+            # A block forwarding one edge of a handler branch whose two edges reach the
+            # continuation (`split_duplicate_edges!` makes it from the mux's branch) runs
+            # after the pop, but belongs with its branch: else the try would continue both
+            # at it and at its target. (The catch dominates it: `preds` has no edge for the
+            # entry of the function, which a handler branch may also reach.)
+            for (x, ps) in enumerate(preds)
+                (stacks[x] !== nothing && !(x in handler) && length(ps) == 1 &&
+                 only(ps) in handler && dominates(domtree, c, x)) || continue
+                is_handler_forward(m, only(ps), x) && push!(handler, x)
+            end
         end
         regions[t.id] = TryRegion(t.id, bid, body, handler, length(σ))
     end
     return regions
+end
+
+"""Whether `x` only forwards one edge of `p`'s branch to the target of its other edge: no
+arguments or statements, and a `goto` there."""
+function is_handler_forward(m::MCFG, p::Int, x::Int)
+    b, t = m.blocks[x], m.blocks[p].term
+    (isempty(b.args) && isempty(b.body) && b.term isa MGoto && t isa MCondBr) || return false
+    other = t.f.target == x ? t.t.target : t.f.target
+    return other == b.term.edge.target
 end
 
 """Whether exception state `s` lies inside the catch of the enter `e`: it is `e`'s own
