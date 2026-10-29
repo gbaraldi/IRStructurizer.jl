@@ -22,6 +22,9 @@ also records the throws that a handler catches."""
 @noinline eh_h(x::Int) = x < 0 ? eh_throw(DomainError(x)) : x * 2
 const EH_SV = ScopedValue(1)
 @noinline eh_readsv() = EH_SV[]
+# A counter a loop's condition reads: true for the first `n` calls since the reset.
+const EH_NTICK = Ref(0)
+@noinline eh_tick(n::Int) = (EH_NTICK[] += 1; EH_NTICK[] <= n)
 
 """The outcome of a call: `(:ok, value)` or `(:threw, payload)`, the `eh_log` calls it
 made, and the exception-stack depth after a normal return (-1 after a throw). A
@@ -675,6 +678,67 @@ end
     ], Any[Any])
     for _ in 1:20
         @test !IRStructurizer.normalize_one_irreducible!(IRStructurizer.ingest(ir))
+    end
+end
+
+"""What `eh_split_handler_branch_ir` computes."""
+eh_split_handler_branch(flag::Bool) = try throw(nothing) catch; flag ? 1 : 2 end
+
+"""A handler whose branch continues the try on both arms, the shape that IR with the
+upsilon apart from the enter has (native lowering of this function does not). The mux
+gives that branch two edges to its block, and the lift splits one through a
+trampoline, which runs after the `pop_exception`."""
+eh_split_handler_branch_ir() = build_ir([
+    (stmts=[(Core.EnterNode(3), Any)], succs=[2, 3]),
+    (stmts=[(Expr(:call, GlobalRef(Core, :throw), nothing), Union{}),
+            (ReturnNode(), Union{})], succs=Int[]),
+    (stmts=[(Expr(:pop_exception, SSAValue(1)), Nothing),
+            (GotoIfNot(Argument(2), 5), Any)], succs=[4, 5]),
+    (stmts=[(GotoNode(6), Any)], succs=[6]),
+    (stmts=[(GotoNode(6), Any)], succs=[6]),
+    (stmts=[(PhiNode(Int32[4, 5], Any[1, 2]), Int),
+            (ReturnNode(SSAValue(8)), Any)], succs=Int[]),
+], Any[Any, Bool])
+
+@testset "a handler branch split after the mux keeps one continuation" begin
+    ir = eh_split_handler_branch_ir()
+    ir.stmts.flag .= UInt32(0)
+    CC.verify_ir(ir)
+    sci = StructuredIRCode(ir)
+    @test length(eh_ops(sci, TryOp)) == 1
+    @test isempty(eh_compare(eh_split_handler_branch, eh_lower(sci), [(true,), (false,)]))
+end
+
+@testset "the entry block is no handler trampoline" begin
+    # An empty entry block that a handler branch jumps back to looks like a split
+    # trampoline (its one recorded predecessor is in the handler), but the catch does
+    # not dominate it.
+    ir = build_ir([
+        (stmts=[(GotoNode(3), Any)], succs=[3]),
+        (stmts=[(Expr(:pop_exception, SSAValue(6)), Nothing),
+                (GotoIfNot(Argument(3), 1), Any)], succs=[3, 1]),
+        (stmts=[(Expr(:call, GlobalRef(@__MODULE__, :eh_tick), Argument(2)), Bool),
+                (GotoIfNot(SSAValue(4), 6), Any)], succs=[4, 6]),
+        (stmts=[(Core.EnterNode(2), Any)], succs=[5, 2]),
+        (stmts=[(Expr(:call, GlobalRef(Core, :throw), nothing), Union{}),
+                (ReturnNode(), Union{})], succs=Int[]),
+        (stmts=[(ReturnNode(42), Any)], succs=Int[]),
+    ], Any[Any, Int, Bool])
+    ir.stmts.flag .= UInt32(0)
+    CC.verify_ir(ir)
+    raw = CC.copy(ir)
+    raw.argtypes[1] = Tuple{}
+    @static if VERSION >= v"1.12-"
+        raw.debuginfo.def = Symbol("raw")
+    end
+    expected = Core.OpaqueClosure(raw)
+    oc = eh_lower(StructuredIRCode(ir))
+    for flag in (true, false)
+        EH_NTICK[] = 0
+        want = eh_outcome(expected, 3, flag)
+        EH_NTICK[] = 0
+        @test eh_outcome(oc, 3, flag) == want
+        @test want.result == (:ok, 42)
     end
 end
 
